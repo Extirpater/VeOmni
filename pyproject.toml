@@ -27,7 +27,7 @@ dependencies = [
   # uv users; pip users should `pip install transformers==5.16.1` themselves.
   "psutil",
   "timm",
-  "wandb",
+  "wandb>=0.22.3",  # supports API keys longer than 40 characters
   "setuptools",
   "einops>=0.8.1",
   "matplotlib>=3.7",  # veomni.utils.moe_monitor expert-load heatmap

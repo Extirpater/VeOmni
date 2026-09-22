@@ -206,6 +206,30 @@ class AnyPrecisionAdamW(Optimizer):
         }
         super().__init__(params, defaults)
 
+    def _init_state(self, param, group):
+        state = self.state[param]
+        if not state:
+            state["step"] = torch.tensor(0.0)
+            state["exp_avg"] = torch.zeros_like(param, dtype=group["momentum_dtype"])
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=group["variance_dtype"])
+            if group["use_kahan_summation"]:
+                state["compensation"] = torch.zeros_like(param, dtype=group["compensation_buffer_dtype"])
+        return state
+
+    @torch.no_grad()
+    def initialize_state(self):
+        """Allocate checkpoint destinations without gradients or a synthetic update.
+
+        PyTorch DCP otherwise primes a fresh optimizer with a zero-gradient
+        step. On CPU-offloaded models the model-sized temporary gradients can
+        remain in the host allocator and exhaust RAM on the first real backward.
+        Existing states, parameters, gradients and step counters stay unchanged.
+        """
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.requires_grad:
+                    self._init_state(param, group)
+
     @torch.no_grad()
     def step(self, closure=None):
         """
@@ -226,9 +250,6 @@ class AnyPrecisionAdamW(Optimizer):
             eps = group["eps"]
             use_kahan_summation = group["use_kahan_summation"]
 
-            momentum_dtype = group["momentum_dtype"]
-            variance_dtype = group["variance_dtype"]
-            compensation_buffer_dtype = group["compensation_buffer_dtype"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -236,20 +257,7 @@ class AnyPrecisionAdamW(Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("AnyPrecisionAdamW does not support sparse gradients.")
 
-                state = self.state[p]
-                # State initialization
-                if len(state) == 0:
-                    state["step"] = torch.tensor(0.0)
-
-                    # momentum - EMA of gradient values
-                    state["exp_avg"] = torch.zeros_like(p, dtype=momentum_dtype)
-
-                    # variance uncentered - EMA of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=variance_dtype)
-
-                    # optional Kahan summation - accumulated error tracker
-                    if use_kahan_summation:
-                        state["compensation"] = torch.zeros_like(p, dtype=compensation_buffer_dtype)
+                state = self._init_state(p, group)
 
                 # Main processing
                 # update the steps for each param group update
@@ -283,6 +291,15 @@ class AnyPrecisionAdamW(Optimizer):
                     compensation.add_(temp_buffer.sub_(p.data))
                 else:  # usual AdamW updates
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
+
+
+def initialize_optimizer_state_for_load(optimizer):
+    """Use direct state allocation where supported, including nested optimizers."""
+    if isinstance(optimizer, AnyPrecisionAdamW):
+        optimizer.initialize_state()
+    elif getattr(optimizer, "_is_multi_optimizer", False):
+        for sub_optimizer in optimizer.optimizers_dict.values():
+            initialize_optimizer_state_for_load(sub_optimizer)
 
 
 class MultiOptimizer(Optimizer, Stateful):

@@ -46,6 +46,16 @@ def build_data_transform(transform_name: str, **kwargs) -> Callable:
     return partial(DATA_TRANSFORM_REGISTRY[transform_name], **kwargs)
 
 
+@DATA_TRANSFORM_REGISTRY.register("pretokenized")
+def process_pretokenized_example(example, max_seq_len, **kwargs):
+    """Read response-masked token records without retokenization or label shifts."""
+    input_ids = torch.as_tensor(example["input_ids"][:max_seq_len], dtype=torch.long)
+    labels = torch.as_tensor(example["labels"][:max_seq_len], dtype=torch.long)
+    if input_ids.ndim != 1 or labels.shape != input_ids.shape:
+        raise ValueError("Pretokenized input_ids and labels must be aligned one-dimensional arrays")
+    return [{"input_ids": input_ids, "labels": labels, "attention_mask": torch.ones_like(input_ids)}]
+
+
 def split_into_chunks(sequence: Sequence[int], chunk_size: int) -> List[List[int]]:
     """
     Splits a long sequence into chunks.

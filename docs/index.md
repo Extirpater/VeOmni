@@ -65,6 +65,7 @@ hardware_support/mlu/README.md
 :caption: Examples
 
 examples/qwen3.md
+examples/maple_idlm.md
 examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md

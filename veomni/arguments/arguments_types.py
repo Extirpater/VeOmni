@@ -1338,7 +1338,7 @@ class OpsImplementationConfig:
             "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
-    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+    qat_implementation: Literal["none", "fp8_blockwise", "ternary"] = field(
         default="none",
         metadata={
             "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
@@ -1349,7 +1349,8 @@ class OpsImplementationConfig:
             "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
-            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/. "
+            "'ternary' enables Maple's groupwise {-scale, 0, scale} weights with an identity STE."
         },
     )
 
@@ -1518,7 +1519,9 @@ class OpsImplementationConfig:
         # quantizers are the SM90-only TileLang kernels: without this check a
         # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
         # inside the first fake-quant call.
-        if self.qat_implementation != "none":
+        if self.qat_implementation not in ("none", "fp8_blockwise", "ternary"):
+            raise ValueError(f"Unknown QAT recipe: {self.qat_implementation!r}")
+        if self.qat_implementation == "fp8_blockwise":
             import torch
 
             from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
@@ -1785,7 +1788,7 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo", "pretokenized"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -1845,6 +1848,8 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
+            elif self.data_type == "pretokenized":
+                self.text_keys = "input_ids"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

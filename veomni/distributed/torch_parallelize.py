@@ -850,8 +850,14 @@ def build_parallelize_model(
     """
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
+    # A single device still needs FSDP hooks for CPU parameter/gradient offload.
+    # Offload is explicit; ordinary single-device training keeps its existing path.
+    offload_requested = kwargs.get("enable_fsdp_offload", False)
+    if offload_requested and parallel_state.dp_mode != "fsdp2":
+        raise ValueError("CPU parameter offload requires fsdp_mode='fsdp2'.")
+    wrap_distributed = parallel_state.fsdp_enabled or offload_requested
 
-    if not parallel_state.fsdp_enabled:
+    if not wrap_distributed:
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
@@ -883,7 +889,7 @@ def build_parallelize_model(
             device_mesh=parallel_state.tp_mesh,
         )
 
-    if parallel_state.fsdp_enabled:
+    if wrap_distributed:
         logger.info_rank0(f"Apply data parallel to the model: {parallel_state.dp_mode}.")
         if parallel_state.dp_mode == "fsdp2":
             model = parallelize_model_fsdp2(

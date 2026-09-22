@@ -43,7 +43,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
-from ..optim.optimizer import restore_optimizer_param_group_defaults
+from ..optim.optimizer import initialize_optimizer_state_for_load, restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
@@ -279,10 +279,10 @@ class OptimizerState(Stateful):
     base weights) are simply absent from the checkpoint.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
-    so missing optimizer entries are skipped.  For a fresh optimizer (the
-    normal resume path), ``set_optimizer_state_dict`` internally calls
-    ``_init_optim_state`` which pre-fills zero/default state for every
-    param; DCP then overwrites the entries that exist in the checkpoint.
+    so missing optimizer entries are skipped. AnyPrecisionAdamW allocates
+    destinations directly, avoiding PyTorch's model-sized dummy gradients.
+    Other fresh optimizers use PyTorch's ``_init_optim_state`` to pre-fill
+    zero/default state; DCP overwrites entries present in the checkpoint.
     Params absent from the checkpoint keep their default-initialised state,
     equivalent to what AdamW would create on the next ``step()`` call.
 
@@ -314,6 +314,8 @@ class OptimizerState(Stateful):
         self._load = load
 
     def state_dict(self):
+        if self._load:
+            initialize_optimizer_state_for_load(self.optimizer)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
@@ -356,8 +358,7 @@ class OptimizerState(Stateful):
         # Single torch optimizer.
         # ``strict=False`` matches the DCP planner's allow_partial_load intent:
         # params that never received a gradient (and thus have no saved Adam
-        # state) keep the default-initialized state that
-        # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+        # state) keep the default-initialized destination state.
         # Torch 2.11+ raises under the default strict=True when any
         # requires_grad param is missing from the checkpoint (DeepSeek-V4
         # indexer ``position_bias`` is one such case on short toy runs).
