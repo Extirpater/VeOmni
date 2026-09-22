@@ -236,3 +236,30 @@ Core files:
     - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
     - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
     - A regression's reference collective must also use a contiguous buffer for NCCL. Make only the reference clone contiguous; preserve the layout of the actual incoming gradient so transposed, narrowed and expanded inputs remain covered.
+
+## Checkpoint Continuation
+
+29. **Weights-only DCP continuation must restore optimizer learning rates explicitly**
+    - With `load_optimizer=False`, loading scheduler state does not update the fresh optimizer's current learning rates. `ModelCheckpointManager` restores each scheduler's `get_last_lr()` into its own optimizer groups before the first update, including every `MultiLRScheduler` child.
+    - Replacing a full checkpoint with a weights-only checkpoint must drain pending writers and remove that module's obsolete `optimizer/` directory. Leaving it without its marker makes the new checkpoint incomplete.
+
+## Maple iDLM
+
+30. **Maple's training loss must use the trainer's supervised-token denominator**
+    - `mean_global_loss` weights local losses by the unshifted count of labels other than `-100`. Divide both clean and noisy branch sums by that count before combining them. Averaging each branch over its shifted valid targets changes gradients when responses are packed or partitioned differently.
+    - Branch diagnostics may use their own valid-target counts. `tests/models/test_maple_idlm.py` verifies fixed-weight loss and gradient parity across packed microbatches and FSDP2 ranks.
+
+31. **Native Maple row-wise TWN must preserve PyTorch floating-point reductions**
+    - Local latent-master checkpoints use `row_twn`: select weights above `0.7 * mean(abs(weight))` per output row, then scale signs by the mean absolute selected weight. The public `group_absmax` recipe is different and remains explicit.
+    - Fusing the threshold or scale reductions can flip ternary states near a rounding boundary. Compile pointwise CUDA work only, and retain the native reductions behind the custom-op boundary. Compare against the same-device native formula; CPU-generated exports can differ from CUDA at these boundaries.
+
+## Activation Offload
+
+32. **Restored activation storage must track every consumer stream**
+    - Async offload allocates restored device storage on the calling compute stream, then records the event that its transfer stream waits on before copying. This both permits compute-buffer reuse and orders prior users of recycled storage before the overwrite. A prefetched tensor can later be consumed on another stream. Waiting for the H2D event orders the copy before computation, but does not prevent the allocator from recycling storage while queued computation still reads it.
+    - `_unpack_swap_tensor()` must call `record_stream()` with the current consumer stream on every unpack, including repeated saved-tensor access after the manager key is cleared. Copy completion and pinned-host-buffer synchronization do not replace this storage-lifetime dependency.
+    - `tests/distributed/test_async_offload_unit.py` delays a consumer, releases all activation references, and churns allocations on the transfer stream. Without consumer tracking it reads overwritten values under CUDA async allocation.
+
+33. **Large packed iDLM masks must be built at tile granularity**
+    - Generic compiled `create_block_mask()` can materialize a dense boolean `[2N, 2N]` temporary: 25 GiB at 81,920 input tokens per rank. Sparse attention execution does not make this construction sparse.
+    - Maple builds metadata from 128-token bounds with `BlockMask.from_kv_blocks()`. Partial tiles may conservatively include invisible pairs because the unchanged token-level `mask_mod` filters them; full tiles must prove every pair visible. Preserve padding, document, sliding-window and noisy/clean-boundary checks when changing the bounds.

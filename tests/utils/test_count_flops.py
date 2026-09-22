@@ -84,6 +84,49 @@ def test_gb300_device_flops():
         assert get_device_flops() == 2500.0
 
 
+@pytest.mark.usefixtures("mock_device_flops")
+@pytest.mark.parametrize("idlm_enabled", [False, True])
+@pytest.mark.parametrize("block_size", [1, 3, 8])
+@pytest.mark.parametrize("sliding_window", [None, 2])
+def test_maple_flops_match_packed_attention_masks(idlm_enabled, block_size, sliding_window):
+    import torch
+
+    from veomni.models.transformers.maple.runtime import make_idlm_attention_mask
+
+    config = SimpleNamespace(
+        model_type="maple",
+        hidden_size=8,
+        head_dim=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_hidden_layers=2,
+        num_experts=3,
+        num_experts_per_tok=2,
+        moe_intermediate_size=6,
+        vocab_size=20,
+        layer_types=["full_attention", "sliding_attention"],
+        sliding_window=sliding_window,
+        idlm_enabled=idlm_enabled,
+    )
+    lengths = [3, 5]
+    positions = torch.cat([torch.arange(length) for length in lengths])[None]
+    visible_edges = 0
+    for window in (None, sliding_window):
+        mask = make_idlm_attention_mask(positions, torch.ones_like(positions), block_size, sliding_window=window)
+        if not idlm_enabled:
+            mask = mask[..., 8:, 8:]  # the causal clean branch
+        visible_edges += int(mask.sum())
+    # Each layer: 192 attention + 24 router + 288 active expert weights.
+    # Two layers plus the 160-weight LM head = 1168 active matmul weights.
+    streams = 2 if idlm_enabled else 1
+    expected = (6 * 1168 * 8 * streams + 12 * 8 * visible_edges) / 1.25 / 1e12
+    counter = VeomniFlopsCounter(config)
+    achieved, promised = counter.estimate_flops(lengths, delta_time=1.25)
+    assert achieved == pytest.approx(expected, rel=1e-12)
+    assert promised == 1000.0
+    assert counter.estimate_flops([], delta_time=1.0)[0] == 0
+
+
 @pytest.fixture
 def qwen3_5_counter():
     config = _load_toy_config("tests/toy_config/qwen3_5_toy")

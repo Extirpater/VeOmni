@@ -1,4 +1,5 @@
-# Full-parameter ternary QAT on one H100 80GB with >= 220 GiB available host RAM.
+# Measured eight-H100 recipe: stride 2, fused packed experts, QAT, FSDP2.
+# Launch with PYTORCH_ALLOC_CONF=backend:cudaMallocAsync; allow 160 GiB for weights rotation.
 # Paths and mask ID are filled from the pinned preparation manifest by launch.py.
 model:
   model_path: outputs/maple_idlm/model
@@ -16,7 +17,7 @@ model:
     use_cache: false
   ops_implementation:
     attn_implementation: flex_attention
-    moe_implementation: fused_triton
+    moe_implementation: fused_quack
     qat_implementation: ternary
     cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
@@ -24,12 +25,12 @@ model:
     swiglu_mlp_implementation: eager
     load_balancing_loss_implementation: eager
   optimizer:
-    type: anyprecision_adamw
+    type: adamw
     lr: 1.0e-5
     lr_min: 1.0e-6
     lr_decay_style: cosine
-    # Ten warmup updates for this 12-hour, 10000-step-capped continuation.
-    lr_warmup_ratio: 0.001
+    # 100 warmup updates out of 6,104 scheduled updates.
+    lr_warmup_ratio: 0.0163827
     max_grad_norm: 1.0
   accelerator:
     init_device: meta
@@ -39,39 +40,48 @@ model:
       enable_reentrant: false
     fsdp_config:
       fsdp_mode: fsdp2
-      offload: true
+      offload: false
       offload_pin_memory: false
       forward_prefetch: false
       mixed_precision:
-        enable: false
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_async_activation: true
+      activation_offload_host_cache_limit_gb: 24.0
 data:
   train_path: outputs/maple_idlm/train
-  data_type: pretokenized
+  data_type: conversation
+  text_keys: conversations
   max_seq_len: 4096
-  train_size: 4500000000
-  datasets_type: iterable
+  train_size: 4000000000
+  datasets_type: mapping
   dataset_repeat: true
   dataloader:
-    num_workers: 0
+    num_workers: 4
+    worker_num_threads: 1
+    prefetch_factor: 2
+    persistent_workers: true
     pin_memory: false
 train:
-  global_batch_size: 4
-  micro_batch_size: 1
+  global_batch_size: 160
+  micro_batch_size: 20
   dyn_bsz: true
   pad_to_length: true
   bsz_warmup_ratio: 0.0
   num_train_epochs: 1
-  max_steps: 10000
+  max_steps: 6104
   checkpoint:
     output_dir: outputs/maple_idlm/run
     manager: dcp
     save_optimizer: false
     load_optimizer: false
     load_path: null
-    save_steps: 10
+    save_steps: 1000
     save_epochs: 1
     save_hf_weights: false
   wandb:
     enable: true
     project: maple-idlm
-    name: maple-idlm-ternary-qat
+    name: maple-idlm-b1-fused-8xh100

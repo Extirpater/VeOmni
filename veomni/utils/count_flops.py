@@ -107,6 +107,7 @@ class VeomniFlopsCounter:
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "qwen4_exp": self._estimate_qwen4_exp_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
+            "maple": self._estimate_maple_flops,
         }
 
         self.config = config
@@ -114,6 +115,46 @@ class VeomniFlopsCounter:
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
+
+    def _estimate_maple_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """Count useful Maple training matmuls, including both I-DLM streams.
+
+        Attention counts visible causal edges within each packed document.
+        Recomputed activations, QAT, optimizer work, and communication are
+        excluded: this estimates model FLOPs utilization, not hardware FLOPs.
+        """
+        config = self.config
+        hidden = config.hidden_size
+        query_size = config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+        attention_params = hidden * (2 * query_size + 2 * kv_size)
+        router_params = hidden * config.num_experts
+        expert_params = 3 * hidden * config.moe_intermediate_size * config.num_experts_per_tok
+        active_params = (attention_params + router_params + expert_params) * config.num_hidden_layers
+        active_params += self._compute_lm_head_params(hidden, config.vocab_size)
+        streams = 2 if getattr(config, "idlm_enabled", False) else 1
+        linear_flops = 6 * active_params * tokens_sum * streams
+
+        layer_types = config.layer_types
+        full_layers = layer_types.count("full_attention")
+        sliding_layers = layer_types.count("sliding_attention")
+        if full_layers + sliding_layers != config.num_hidden_layers:
+            raise ValueError("Maple FLOPs require full_attention or sliding_attention for every layer")
+        if config.sliding_window is None:
+            full_layers += sliding_layers
+            sliding_layers = 0
+        full_edges = sum(length * (length + 1) // 2 for length in batch_seqlens)
+        # Maple includes the current key plus sliding_window preceding keys.
+        sliding_edges = (
+            self._compute_sliding_attention_score_sum(batch_seqlens, config.sliding_window + 1)
+            if sliding_layers
+            else 0
+        )
+        # Each noisy query sees exactly one copy of each permitted key position:
+        # its noisy current block and the clean preceding blocks. Its edge count
+        # therefore matches the causal clean stream for every I-DLM block size.
+        attention_flops = 12 * query_size * streams * (full_layers * full_edges + sliding_layers * sliding_edges)
+        return (linear_flops + attention_flops) / delta_time / 1e12
 
     @staticmethod
     def _compute_lm_head_params(hidden_size, vocab_size):

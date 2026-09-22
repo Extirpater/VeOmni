@@ -47,6 +47,26 @@ from veomni.trainer.text_trainer import TextTrainer
 from veomni.trainer.vlm_trainer import VLMTrainer
 
 
+@pytest.mark.parametrize("profile_memory", [False, True])
+def test_profiler_exports_allocator_snapshot_only_when_requested(monkeypatch, tmp_path, profile_memory):
+    from veomni.utils import helper
+
+    captured = {}
+    snapshots = []
+    traces = []
+    device = SimpleNamespace(memory=SimpleNamespace(_dump_snapshot=snapshots.append))
+    monkeypatch.setattr(helper, "get_torch_device", lambda: device)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(helper, "IS_MLU_AVAILABLE", False)
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
+    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: captured.update(kwargs))
+    helper.create_profiler(1, 2, str(tmp_path), False, profile_memory, False, False, 0)
+    captured["on_trace_ready"](SimpleNamespace(export_chrome_trace=traces.append))
+    assert len(traces) == 1
+    assert len(snapshots) == int(profile_memory)
+
+
 class _Output:
     """A model output that carries aux metrics, as DeepSeek-V4's does."""
 

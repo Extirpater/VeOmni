@@ -870,6 +870,11 @@ class DistributedCheckpointer(CheckpointerBase):
         write_root = stage_path or model_root
 
         if stage_path is None:
+            remove_optimizer = state.get("optimizer") is None
+            if remove_optimizer:
+                # An earlier full save may still be writing the directory we
+                # are about to remove. Drain both slots before invalidation.
+                cls.wait_for_pending_save()
             # Nothing stands between this save and the previous checkpoint's
             # shards, so its markers have to go before the first byte lands --
             # otherwise a save that dies part-way leaves one describing shards
@@ -879,7 +884,7 @@ class DistributedCheckpointer(CheckpointerBase):
             #
             # The manifest is not ours either way; ``GlobalStateCallback`` clears
             # the one it writes.
-            cls._remove_dcp_markers(checkpoint_dir, module)
+            cls._remove_dcp_markers(checkpoint_dir, module, remove_optimizer=remove_optimizer)
 
         cls._create_checkpoint_dir(write_root)
 
@@ -929,7 +934,7 @@ class DistributedCheckpointer(CheckpointerBase):
         logger.info_rank0(f"Saved checkpoint to {model_root}")
 
     @classmethod
-    def _remove_dcp_markers(cls, checkpoint_dir: str, module: str) -> None:
+    def _remove_dcp_markers(cls, checkpoint_dir: str, module: str, *, remove_optimizer: bool = False) -> None:
         """Delete the ``.metadata`` files vouching for what this save overwrites.
 
         The unstaged path's invalidation, run before the first byte lands. A
@@ -961,6 +966,10 @@ class DistributedCheckpointer(CheckpointerBase):
                 for marker in dcp_markers(checkpoint_dir, [module]):
                     if os.path.exists(marker):
                         os.remove(marker)
+                if remove_optimizer:
+                    old_optimizer = optimizer_dir(checkpoint_dir, module)
+                    if os.path.exists(old_optimizer):
+                        shutil.rmtree(old_optimizer)
             except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
                 error = e
         raise_if_any_rank_failed(error, f"removing the old DCP markers under {checkpoint_dir}")

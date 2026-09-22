@@ -38,6 +38,10 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     convert_deepseek_v4_fqn_to_index_mapping,
     create_deepseek_v4_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.maple.checkpoint_tensor_converter import (
+    MapleCheckpointTensorConverter,
+    convert_maple_fqn_to_index_mapping,
+)
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -1377,3 +1381,100 @@ class TestQwen3OmniMoeConverterIntegration:
         assert down_res is not None and torch.equal(down_res.tensor, down)
         # Nothing was buffered.
         assert converter.finalize() == []
+
+
+def _maple_converter_fixture():
+    prefix = "model.layers.0.mlp"
+    expected = {
+        f"{prefix}.experts.gate_up_proj": (3, 12, 8),
+        f"{prefix}.experts.down_proj": (3, 8, 6),
+        f"{prefix}.gate.weight": (3, 8),
+    }
+    legacy = {f"{prefix}.gate.weight": torch.randn(3, 8)}
+    for expert in range(3):
+        for projection, shape in [("gate_proj", (6, 8)), ("up_proj", (6, 8)), ("down_proj", (8, 6))]:
+            legacy[f"{prefix}.experts.{expert}.{projection}.weight"] = torch.randn(shape)
+    converter = MapleCheckpointTensorConverter(3, 8, 6, expected_shapes=expected)
+    return converter, legacy, expected
+
+
+def test_maple_converter_shuffled_legacy_and_packed_roundtrip():
+    converter, legacy, expected = _maple_converter_fixture()
+    names = list(legacy)
+    output = {}
+    for index in torch.randperm(len(names), generator=torch.Generator().manual_seed(91)):
+        name = names[index]
+        result = maybe_convert_checkpoint_tensor(name, legacy[name], converter)
+        if result is not None:
+            output[result.name] = result.tensor
+    assert converter.finalize() == []
+    assert output.keys() == expected.keys()
+    prefix = "model.layers.0.mlp"
+    for expert in range(3):
+        torch.testing.assert_close(
+            output[f"{prefix}.experts.gate_up_proj"][expert, :6],
+            legacy[f"{prefix}.experts.{expert}.gate_proj.weight"],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            output[f"{prefix}.experts.gate_up_proj"][expert, 6:],
+            legacy[f"{prefix}.experts.{expert}.up_proj.weight"],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            output[f"{prefix}.experts.down_proj"][expert],
+            legacy[f"{prefix}.experts.{expert}.down_proj.weight"],
+            atol=0,
+            rtol=0,
+        )
+    packed = MapleCheckpointTensorConverter(3, 8, 6, expected_shapes=expected)
+    for name, tensor in output.items():
+        assert packed.convert(name, tensor).tensor is tensor
+    assert packed.finalize() == []
+    mapping = convert_maple_fqn_to_index_mapping({name: index % 3 + 1 for index, name in enumerate(legacy)})
+    assert mapping.keys() == expected.keys()
+    assert convert_maple_fqn_to_index_mapping(mapping) == mapping
+
+
+@pytest.mark.parametrize("missing", ["one_expert", "all_down", "whole_layer", "router"])
+def test_maple_converter_rejects_incomplete_weights(missing):
+    converter, legacy, _ = _maple_converter_fixture()
+    for name, tensor in legacy.items():
+        skip = (
+            missing == "whole_layer"
+            or (missing == "one_expert" and ".experts.2." in name)
+            or (missing == "all_down" and ".down_proj." in name)
+            or (missing == "router" and name.endswith(".gate.weight"))
+        )
+        if not skip:
+            converter.convert(name, tensor)
+    with pytest.raises(RuntimeError, match="Incomplete|Missing"):
+        converter.finalize()
+
+
+@pytest.mark.parametrize(
+    "error", ["duplicate", "duplicate_id_alias", "out_of_range", "shape", "packed_shape", "mixed", "unexpected"]
+)
+def test_maple_converter_rejects_malformed_weights(error):
+    converter, legacy, _ = _maple_converter_fixture()
+    name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    tensor = legacy[name]
+    if error in ("duplicate", "duplicate_id_alias", "mixed"):
+        converter.convert(name, tensor)
+    with pytest.raises(ValueError):
+        if error == "duplicate":
+            converter.convert(name, tensor)
+        elif error == "duplicate_id_alias":
+            converter.convert(name.replace(".experts.0.", ".experts.00."), tensor)
+        elif error == "out_of_range":
+            converter.convert(name.replace(".experts.0.", ".experts.3."), tensor)
+        elif error == "shape":
+            converter.convert(name, tensor.T)
+        elif error == "packed_shape":
+            converter.convert("model.layers.0.mlp.experts.gate_up_proj", torch.empty(3, 8, 12))
+        elif error == "mixed":
+            converter.convert("model.layers.0.mlp.experts.down_proj", torch.empty(3, 8, 6))
+        else:
+            converter.convert("model.layers.99.mlp.experts.0.gate_proj.weight", tensor)

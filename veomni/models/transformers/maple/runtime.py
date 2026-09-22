@@ -59,20 +59,78 @@ def idlm_mask_mod(position_ids, valid_tokens, block_size, sliding_window=None):
     return mask_mod
 
 
+def _idlm_tile_masks(position_ids, valid_tokens, block_size, sliding_window, tile_size=128):
+    """Bound visibility per tile without constructing a token-by-token mask.
+
+    Partial tiles may conservatively contain invisible pairs; mask_mod checks
+    those pairs in attention. A full tile must prove that every pair is visible.
+    Bounds also cover tiles crossing documents or the noisy/clean boundary.
+    """
+    batch, length = position_ids.shape
+    tiles = (2 * length + tile_size - 1) // tile_size
+    indices = torch.arange(tiles * tile_size, device=position_ids.device)
+    source = indices % length
+    positions = position_ids[:, source].reshape(batch, tiles, tile_size)
+    segments = (position_ids == 0).to(torch.int32).cumsum(-1)[:, source].reshape(batch, tiles, tile_size)
+    valid = (valid_tokens[:, source] & (indices < 2 * length)).reshape(batch, tiles, tile_size)
+    clean = (indices >= length).reshape(1, tiles, tile_size)
+
+    pmin, pmax = positions.amin(-1), positions.amax(-1)
+    smin, smax = segments.amin(-1), segments.amax(-1)
+    bmin, bmax = pmin // block_size, pmax // block_size
+    any_clean, all_clean = clean.any(-1), clean.all(-1)
+    any_valid, all_valid = valid.any(-1), valid.all(-1)
+
+    qmin, qmax, kmin, kmax = pmin[:, :, None], pmax[:, :, None], pmin[:, None, :], pmax[:, None, :]
+    qbmin, qbmax, kbmin, kbmax = bmin[:, :, None], bmax[:, :, None], bmin[:, None, :], bmax[:, None, :]
+    possible = (
+        (~all_clean[:, :, None] & ~all_clean[:, None, :] & (qbmin <= kbmax) & (kbmin <= qbmax) & (kmin <= qmax))
+        | (~all_clean[:, :, None] & any_clean[:, None, :] & (kbmin < qbmax))
+        | (any_clean[:, :, None] & any_clean[:, None, :] & (kmin <= qmax))
+    )
+    possible &= (smin[:, :, None] <= smax[:, None, :]) & (smin[:, None, :] <= smax[:, :, None])
+    possible &= any_valid[:, :, None] & any_valid[:, None, :]
+
+    full = (
+        (
+            ~any_clean[:, :, None]
+            & ~any_clean[:, None, :]
+            & (qbmin == qbmax)
+            & (qbmin == kbmin)
+            & (qbmin == kbmax)
+            & (kmax <= qmin)
+        )
+        | (~any_clean[:, :, None] & all_clean[:, None, :] & (kbmax < qbmin))
+        | (all_clean[:, :, None] & all_clean[:, None, :] & (kmax <= qmin))
+    )
+    full &= (smin[:, :, None] == smax[:, :, None]) & (smin[:, None, :] == smax[:, None, :])
+    full &= smin[:, :, None] == smin[:, None, :]
+    full &= all_valid[:, :, None] & all_valid[:, None, :]
+    if sliding_window is not None:
+        possible &= qmin - kmax <= sliding_window
+        full &= qmax - kmin <= sliding_window
+    return (possible & ~full)[:, None], full[:, None]
+
+
 def make_idlm_attention_mask(position_ids, valid_tokens, block_size, *, sliding_window=None, flex=False):
     mask_mod = idlm_mask_mod(position_ids, valid_tokens.bool(), block_size, sliding_window)
     batch_size, length = position_ids.shape
     if flex:
-        from torch.nn.attention.flex_attention import create_block_mask
+        from torch.nn.attention.flex_attention import BlockMask
 
-        return create_block_mask(
-            mask_mod,
-            B=batch_size,
-            H=None,
-            Q_LEN=2 * length,
-            KV_LEN=2 * length,
-            device=str(position_ids.device),
-            _compile=True,
+        partial, full = _idlm_tile_masks(position_ids, valid_tokens.bool(), block_size, sliding_window)
+
+        def ordered(tiles):
+            counts = tiles.sum(-1, dtype=torch.int32)
+            indices = tiles.to(torch.int32).argsort(dim=-1, descending=True, stable=True).to(torch.int32)
+            return counts.contiguous(), indices.contiguous()
+
+        return BlockMask.from_kv_blocks(
+            *ordered(partial),
+            *ordered(full),
+            BLOCK_SIZE=128,
+            mask_mod=mask_mod,
+            seq_lengths=(2 * length, 2 * length),
         )
     batch = torch.arange(batch_size, device=position_ids.device)[:, None, None]
     query = torch.arange(2 * length, device=position_ids.device)[None, :, None]

@@ -15,6 +15,8 @@ class MapleConfig(ReferenceMapleConfig):
         mask_token_id=None,
         idlm_initialize_mask_token=False,
         ternary_group_size=128,
+        ternary_scheme="group_absmax",
+        expert_weight_layout="packed_gate_up",
         sliding_window=512,
         layer_types=None,
         nope_on_global_attention=True,
@@ -28,6 +30,10 @@ class MapleConfig(ReferenceMapleConfig):
         self.mask_token_id = mask_token_id
         self.idlm_initialize_mask_token = idlm_initialize_mask_token
         self.ternary_group_size = ternary_group_size
+        self.ternary_scheme = ternary_scheme
+        if expert_weight_layout != "packed_gate_up":
+            raise ValueError("Maple requires expert_weight_layout=packed_gate_up; convert legacy weights on load")
+        self.expert_weight_layout = expert_weight_layout
         self.sliding_window = sliding_window
         self.nope_on_global_attention = nope_on_global_attention
         self.layer_types = layer_types or [
@@ -44,10 +50,15 @@ class MapleConfig(ReferenceMapleConfig):
             raise ValueError("Maple layer_types must name every decoder layer")
         if self.idlm_enabled and (self.mask_token_id is None or not 0 <= self.mask_token_id < self.vocab_size):
             raise ValueError("I-DLM needs an in-vocabulary mask_token_id")
-        if self.ternary_group_size <= 0 or self.ternary_group_size & (self.ternary_group_size - 1):
-            raise ValueError("Maple ternary_group_size must be a positive power of two")
-        if self.hidden_size % self.ternary_group_size or self.moe_intermediate_size % self.ternary_group_size:
-            raise ValueError("Maple hidden and expert intermediate dimensions must be divisible by ternary_group_size")
+        if self.ternary_scheme not in ("group_absmax", "row_twn"):
+            raise ValueError("Maple ternary_scheme must be group_absmax or row_twn")
+        if self.ternary_scheme == "group_absmax":
+            if self.ternary_group_size <= 0 or self.ternary_group_size & (self.ternary_group_size - 1):
+                raise ValueError("Maple ternary_group_size must be a positive power of two")
+            if self.hidden_size % self.ternary_group_size or self.moe_intermediate_size % self.ternary_group_size:
+                raise ValueError(
+                    "Maple hidden and expert intermediate dimensions must be divisible by ternary_group_size"
+                )
         if is_parallel_state_initialized():
             state = get_parallel_state()
             if state.sp_enabled or state.any_extra_parallel_enabled:
@@ -56,7 +67,7 @@ class MapleConfig(ReferenceMapleConfig):
         if ops is not None:
             if ops.qat_implementation not in ("none", "ternary"):
                 raise ValueError("Maple supports only none or ternary QAT")
-            if ops.moe_implementation not in ("eager", "fused_triton"):
-                raise ValueError("Maple MoE currently supports eager and fused_triton")
+            if ops.moe_implementation not in ("eager", "fused_triton", "fused_quack"):
+                raise ValueError("Maple MoE supports eager, fused_triton, and fused_quack")
             if ops.attn_implementation not in ("eager", "sdpa", "flex_attention", "veomni_flex_attention_with_sp"):
                 raise ValueError("Maple requires SDPA/eager reference attention or FlexAttention for I-DLM masks")

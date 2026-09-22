@@ -28,7 +28,7 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | Path | Holds | Written by |
 |------|-------|------------|
 | `model/**/ckpt/` | Weights. A LoRA run stores only the trainable adapter tensors; the frozen base is reloaded from `model.model_path`. | All ranks, via DCP |
-| `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
+| `model/**/optimizer/` | Optimizer state, when `train.checkpoint.save_optimizer` is true (the default). | All ranks, via DCP |
 | `model/**/lr_scheduler.pt` | `lr_scheduler.state_dict()`. | Rank 0 |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
 | `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `torch_rng_state`. | Rank R |
@@ -36,6 +36,15 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size. Trainer-level completion only. | Rank 0, last |
 | `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`. | Rank 0 |
+
+For smaller DCP checkpoints, set `train.checkpoint.save_optimizer: false`.
+This omits optimizer tensors while retaining model weights and the small
+scheduler, RNG, and data-cursor sidecars. Set `train.checkpoint.load_optimizer:
+false` when continuing from these checkpoints: weights, the learning-rate
+schedule, and data progress are restored, but optimizer moments start fresh.
+This continuation is not numerically equivalent to a full optimizer resume.
+Both options default to `true`; disabling either is supported only with the
+`dcp` checkpoint manager.
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`

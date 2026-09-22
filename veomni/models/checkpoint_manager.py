@@ -178,6 +178,13 @@ class ModelCheckpointManager:
         lr_scheduler = self.runtime.lr_scheduler
         if lr_state is not None and lr_scheduler is not None:
             lr_scheduler.load_state_dict(lr_state)
+            if not self.config.load_optimizer:
+                # Scheduler state does not restore the optimizer's current LR.
+                # MultiLRScheduler.get_last_lr() covers only its first child.
+                schedulers = lr_scheduler.values() if isinstance(lr_scheduler, dict) else (lr_scheduler,)
+                for scheduler in schedulers:
+                    for group, lr in zip(scheduler.optimizer.param_groups, scheduler.get_last_lr(), strict=True):
+                        group["lr"] = lr
 
         self.runtime.load_extra_state(extra_state)
 
@@ -190,7 +197,7 @@ class ModelCheckpointManager:
         self.wait_for_pending_save()
         state: Dict[str, Any] = {
             "model": self.runtime.model,
-            "optimizer": self.runtime.optimizer,
+            "optimizer": self.runtime.optimizer if self.config.load_optimizer else None,
             "extra_state": {},
         }
         self.checkpointer.load(
@@ -216,7 +223,7 @@ class ModelCheckpointManager:
             self.config.save_path,
             {
                 "model": self.runtime.model,
-                "optimizer": self.runtime.optimizer,
+                "optimizer": self.runtime.optimizer if self.config.save_optimizer else None,
                 "extra_state": extra_state,
             },
             global_steps=state.global_step,

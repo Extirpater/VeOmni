@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from patchgen import PatchConfig
 from torch import nn
 from transformers.generation.utils import GenerationMixin
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
@@ -30,6 +31,7 @@ config.add_import(
 )
 config.add_import("veomni.ops.qat.ternary", names=["ternary_fake_quant_weight", "ternary_linear"])
 config.add_import("transformers.modeling_utils", names=["ALL_ATTENTION_FUNCTIONS"])
+config.add_import("transformers.modeling_layers", names=["GradientCheckpointingLayer"])
 config.add_post_import_block("""
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 veomni_qat = OpsConfigSlot("qat_implementation")
@@ -75,6 +77,8 @@ def rms_norm_forward(self, hidden_states):
     return self.weight * normed.to(hidden_states.dtype)
 
 
+# Patch: MapleMLP.__init__
+# 1. Retain the checkpoint's ternary recipe for the eager expert path.
 @config.override_method("MapleMLP.__init__")
 def mlp_init(self, config, intermediate_size):
     super().__init__()
@@ -82,58 +86,103 @@ def mlp_init(self, config, intermediate_size):
     self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
     self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
     self.group_size = config.ternary_group_size
+    # --- Patch.1 ---
+    self.ternary_scheme = config.ternary_scheme
+    # --- Patch.1 ---
 
 
+# Patch: MapleMLP.forward
+# 1. Use the configured ternary recipe for all three expert projections.
 @config.override_method("MapleMLP.forward")
 def mlp_forward(self, inputs):
-    options = dict(group_size=self.group_size, enabled=veomni_qat.value == "ternary")
+    # --- Patch.1 ---
+    options = dict(group_size=self.group_size, scheme=self.ternary_scheme, enabled=veomni_qat.value == "ternary")
+    # --- Patch.1 ---
     gate = ternary_linear(inputs, self.gate_proj.weight, **options).clamp(max=7.0)
     up = ternary_linear(inputs, self.up_proj.weight, **options).clamp(-7.0, 7.0)
     return ternary_linear(F.silu(gate) * up, self.down_proj.weight, **options)
+
+
+@config.add_helper
+class MapleExperts(nn.Module):
+    """Packed experts with concatenated gate/up rows, not interleaved rows."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(config.num_experts, 2 * config.moe_intermediate_size, config.hidden_size)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(config.num_experts, config.hidden_size, config.moe_intermediate_size)
+        )
+
+    def forward(self, hidden_states, indices, weights):
+        gate_up, down = self.gate_up_proj, self.down_proj
+        if veomni_qat.value == "ternary":
+            options = dict(group_size=self.config.ternary_group_size, scheme=self.config.ternary_scheme)
+            gate_up = ternary_fake_quant_weight(gate_up, **options)
+            down = ternary_fake_quant_weight(down, **options)
+        if veomni_moe.value in ("fused_triton", "fused_quack"):
+            if veomni_moe.value == "fused_quack":
+                from veomni.ops.kernels.moe.quack_gemm import quack_gemm_fused_moe_forward as moe_kernel
+            else:
+                from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward as moe_kernel
+            return moe_kernel(
+                num_experts=self.config.num_experts,
+                routing_weights=weights.to(hidden_states.dtype),
+                selected_experts=indices,
+                hidden_states=hidden_states,
+                fc1_1_weight=None,
+                fc1_2_weight=None,
+                fc1_1_2_weight=gate_up,
+                fc2_weight=down,
+                swiglu_limit=7.0,
+            )
+        if veomni_moe.value != "eager":
+            raise ValueError(f"Unsupported Maple MoE implementation: {veomni_moe.value}")
+        output = torch.zeros_like(hidden_states, dtype=torch.float32)
+        for expert_id in range(self.config.num_experts):
+            tokens, slots = torch.where(indices == expert_id)
+            gate_weight, up_weight = gate_up[expert_id].chunk(2, dim=0)
+            gate = F.linear(hidden_states[tokens], gate_weight).clamp(max=7.0)
+            up = F.linear(hidden_states[tokens], up_weight).clamp(-7.0, 7.0)
+            expert_output = F.linear(F.silu(gate) * up, down[expert_id])
+            output = output.index_add(0, tokens, expert_output.float() * weights[tokens, slots, None])
+        return output.to(hidden_states.dtype)
+
+
+@config.override_method("MapleSparseMoeBlock._setup_experts")
+def setup_experts(self):
+    self.experts = MapleExperts(self.config)
 
 
 @config.override_method("MapleSparseMoeBlock.forward")
 def moe_forward(self, hidden_states):
     indices, weights, router_logits = self.gate(hidden_states)
     flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-    if veomni_moe.value == "fused_triton":
-        from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
-
-        # Stack transient compute operands; retain all public checkpoint names.
-        operands = []
-        for projection in ("gate_proj", "up_proj", "down_proj"):
-            operand = torch.stack([getattr(expert, projection).weight for expert in self.experts])
-            if veomni_qat.value == "ternary":
-                operand = ternary_fake_quant_weight(operand, self.config.ternary_group_size)
-            operands.append(operand)
-        output = group_gemm_fused_moe_forward(
-            num_experts=len(self.experts),
-            routing_weights=weights.to(flat.dtype),
-            selected_experts=indices,
-            hidden_states=flat,
-            fc1_1_weight=operands[0],
-            fc1_2_weight=operands[1],
-            fc2_weight=operands[2],
-            swiglu_limit=7.0,
-        )
-    elif veomni_moe.value == "eager":
-        output = torch.zeros_like(flat, dtype=torch.float32)
-        for expert_id, expert in enumerate(self.experts):
-            tokens, slots = torch.where(indices == expert_id)
-            expert_output = expert(flat[tokens])
-            output = output.index_add(0, tokens, expert_output.float() * weights[tokens, slots, None])
-        output = output.to(flat.dtype)
-    else:
-        raise ValueError(f"Unsupported Maple MoE implementation: {veomni_moe.value}")
-    return output.reshape_as(hidden_states), router_logits
+    return self.experts(flat, indices, weights).reshape_as(hidden_states), router_logits
 
 
+@config.override_method("MapleSparseMoeBlock.moe_infer")
+def moe_infer(self, hidden_states, topk_ids, topk_weight):
+    return self.experts(hidden_states, topk_ids, topk_weight)
+
+
+# Patch: MapleAttention.forward
+# 1. Quantize attention projections with the checkpoint's ternary recipe.
 @config.override_method("MapleAttention.forward")
 def attention_forward(
     self, hidden_states, attention_mask=None, position_embeddings=None, past_key_value=None, use_cache=False, **kwargs
 ):
     batch, length, _ = hidden_states.shape
-    options = dict(group_size=self.config.ternary_group_size, enabled=veomni_qat.value == "ternary")
+    # --- Patch.1 ---
+    options = dict(
+        group_size=self.config.ternary_group_size,
+        scheme=self.config.ternary_scheme,
+        enabled=veomni_qat.value == "ternary",
+    )
+    # --- Patch.1 ---
     query = (
         ternary_linear(hidden_states, self.q_proj.weight, **options)
         .view(batch, length, self.num_heads, self.head_dim)
@@ -184,6 +233,46 @@ def attention_forward(
     return ternary_linear(output, self.o_proj.weight, self.o_proj.bias, **options), None, past_key_value
 
 
+@config.replace_class("MapleDecoderLayer")
+class MapleDecoderLayer(GradientCheckpointingLayer):
+    """Keep checkpointing inside the layer so activation offload can wrap it."""
+
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.self_attn = MapleAttention(config=config, layer_idx=layer_idx)
+        self.mlp = MapleSparseMoeBlock(config)
+        self.input_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MapleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        output_router_logits=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        attention, attention_weights, present = self.self_attn(
+            hidden_states=self.input_layernorm(hidden_states),
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = hidden_states + attention
+        expert_output, router_logits = self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states + expert_output, attention_weights, present, 0.0, router_logits
+
+
 @config.replace_class("MaplePreTrainedModel")
 class MaplePreTrainedModel(PreTrainedModel):
     config_class = MapleConfig
@@ -201,6 +290,9 @@ class MaplePreTrainedModel(PreTrainedModel):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, MapleRMSNorm):
             nn.init.ones_(module.weight)
+        elif isinstance(module, MapleExperts):
+            nn.init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
+            nn.init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
 @config.override_method("MapleModel.forward")
@@ -275,25 +367,20 @@ def model_forward(
     hidden = inputs_embeds
     positions = self.rotary_emb(hidden, position_ids)
     for layer in self.layers:
-        if self.gradient_checkpointing and self.training:
-            outputs = self._gradient_checkpointing_func(
-                layer.__call__,
-                hidden,
-                attention_mask=attention_mask,
-                position_embeddings=positions,
-            )
-        else:
-            outputs = layer(
-                hidden,
-                attention_mask=attention_mask,
-                position_embeddings=positions,
-                past_key_value=past_key_values,
-                use_cache=use_cache,
-            )
+        outputs = layer(
+            hidden,
+            attention_mask=attention_mask,
+            position_embeddings=positions,
+            past_key_value=past_key_values,
+            use_cache=use_cache,
+        )
         hidden = outputs[0]
     return MoeModelOutputWithPast(last_hidden_state=self.norm(hidden), past_key_values=past_key_values)
 
 
+# Patch: MapleForCausalLM
+# 1. Normalize supervised loss sums by the trainer's unshifted response-token
+#    count so packing and data-parallel partitioning preserve the objective.
 @config.replace_class("MapleForCausalLM")
 class MapleForCausalLM(MaplePreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.word_embeddings.weight"}
@@ -369,14 +456,21 @@ class MapleForCausalLM(MaplePreTrainedModel, GenerationMixin):
         hidden = outputs.last_hidden_state
         if labels is None:
             return MapleOutputWithPast(logits=self.lm_head(hidden), past_key_values=outputs.past_key_values)
+        # --- Patch.1 ---
+        normalizer = (labels != -100).sum().clamp_min(1)
+        clean_count = (targets != -100).sum()
         if noisy_targets is None:
-            loss = linear_loss(hidden, self.lm_head.weight, targets, veomni_ce.value)
+            loss = linear_loss(hidden, self.lm_head.weight, targets, veomni_ce.value) * clean_count / normalizer
         else:
             noisy_hidden, clean_hidden = hidden.chunk(2, dim=1)
             masked_loss = linear_loss(noisy_hidden, self.lm_head.weight, noisy_targets, veomni_ce.value)
             clean_loss = linear_loss(clean_hidden, self.lm_head.weight, targets, veomni_ce.value)
             loss = balanced_idlm_loss(
-                masked_loss, clean_loss, self.config.idlm_clean_weight, self.config.idlm_auto_balance
+                masked_loss * (noisy_targets != -100).sum() / normalizer,
+                clean_loss * clean_count / normalizer,
+                self.config.idlm_clean_weight,
+                self.config.idlm_auto_balance,
             )
             metrics = {"idlm_masked_ce": masked_loss.detach(), "idlm_clean_ce": clean_loss.detach()}
+        # --- Patch.1 ---
         return MapleOutputWithPast(loss=loss, aux_metrics=metrics)

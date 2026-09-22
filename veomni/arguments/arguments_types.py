@@ -788,6 +788,16 @@ class CheckpointConfig:
         default="dcp",
         metadata={"help": "Checkpoint manager."},
     )
+    save_optimizer: bool = field(
+        default=True,
+        metadata={
+            "help": "Include optimizer state in distributed checkpoints. False saves weights and small sidecars."
+        },
+    )
+    load_optimizer: bool = field(
+        default=True,
+        metadata={"help": "Restore optimizer state on resume. False keeps a fresh optimizer while restoring weights."},
+    )
     save_async: bool = field(
         default=False,
         metadata={
@@ -879,6 +889,9 @@ class CheckpointConfig:
                 "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
                 "returns, which an in-flight write would then be reading from."
             )
+
+        if self.manager != "dcp" and (not self.save_optimizer or not self.load_optimizer):
+            raise ValueError("save_optimizer=False and load_optimizer=False require the dcp checkpoint manager")
 
         if self.save_timeout_seconds is None:
             return
@@ -1350,7 +1363,7 @@ class OpsImplementationConfig:
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
             "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/. "
-            "'ternary' enables Maple's groupwise {-scale, 0, scale} weights with an identity STE."
+            "'ternary' enables Maple's configured {-scale, 0, scale} weight recipe with an identity STE."
         },
     )
 

@@ -1,7 +1,7 @@
-"""Download pinned Maple/OpenThoughts3 snapshots and prepare response-only tokens."""
+"""Prepare OpenThoughts3 assets for online or offline Maple tokenization."""
 
 import argparse
-import hashlib
+import fcntl
 import json
 import multiprocessing
 import os
@@ -13,6 +13,9 @@ import pyarrow.parquet as pq
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
+from veomni.data.maple import conversation_split, encode_conversation
+from veomni.models.transformers.maple.provenance import local_model_revision
+
 
 MODEL_ID = "deepgrove/maple-preview"
 MODEL_REVISION = "ac1ddd79d2b5cb4406f5d2bebdf95406ce505a07"
@@ -22,33 +25,27 @@ PREPARATION_VERSION = 1
 _TOKENIZER = None
 
 
-def encode_conversation(conversation, tokenizer, max_length):
-    messages = [
-        {
-            "role": {"human": "user", "gpt": "assistant"}.get(m.get("from"), m.get("role")),
-            "content": m.get("value", m.get("content", "")),
+def validate_preparation_root(root, manifest):
+    """Never mix tokenizations or shard selections in a directory dataset."""
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text())
+        if previous.get("tokenization", "offline") != manifest.get("tokenization", "offline"):
+            raise ValueError("Preparation changed tokenization mode; choose a new --root")
+        for key in ("model_revision", "dataset_revision", "max_length", "requested_shards", "ternary_scheme"):
+            if previous.get(key) != manifest.get(key):
+                raise ValueError(f"Preparation changed {key}; choose a new --root to preserve existing data")
+    expected = {f"train-{i:05d}-of-00120.parquet" for i in range(manifest["requested_shards"])}
+    for split in ("train", "validation"):
+        existing = {
+            path.relative_to(root / split).as_posix()
+            for path in (root / split).rglob("*")
+            if path.is_file() and path.suffix != ".tmp"
         }
-        for m in conversation
-    ]
-    ids, labels = [], []
-    # Match Maple's native chat template, retaining reasoning traces verbatim.
-    for index, message in enumerate(messages):
-        prefix = (
-            tokenizer.apply_chat_template(messages[:index], tokenize=False, add_generation_prompt=False)
-            if index
-            else ""
-        )
-        rendered = tokenizer.apply_chat_template(messages[: index + 1], tokenize=False, add_generation_prompt=False)
-        if not rendered.startswith(prefix):
-            raise ValueError("Tokenizer template rewrites previous turns; cannot derive a safe assistant mask")
-        tokens = tokenizer.encode(rendered[len(prefix) :], add_special_tokens=False)
-        ids.extend(tokens)
-        labels.extend(tokens if message["role"] == "assistant" else [-100] * len(tokens))
-    # Keep the first max_length tokens; the unused suffix is not another sample.
-    ids, labels = ids[:max_length], labels[:max_length]
-    if len(ids) < 2 or sum(label != -100 for label in labels[1:]) < 2:
-        return None
-    return {"input_ids": ids, "labels": labels}
+        if existing and not manifest_path.exists():
+            raise ValueError(f"Existing {split} data has no manifest; choose a new --root")
+        if existing - expected:
+            raise ValueError(f"Unexpected shards in {split}; choose a new --root")
 
 
 def init_worker(tokenizer_path):
@@ -58,9 +55,9 @@ def init_worker(tokenizer_path):
 
 
 def prepare_shard(job):
-    root, file, max_length = job
+    root, file, max_length, model_revision = job
     marker = root / "preparation" / (Path(file).stem + ".json")
-    signature = dict(version=PREPARATION_VERSION, max_length=max_length, model=MODEL_REVISION, data=DATA_REVISION)
+    signature = dict(version=PREPARATION_VERSION, max_length=max_length, model=model_revision, data=DATA_REVISION)
     if marker.exists():
         cached = json.loads(marker.read_text())
         if cached["signature"] == signature and all(
@@ -85,10 +82,7 @@ def prepare_shard(job):
                 if encoded is None:
                     stats["skipped"] += 1
                     continue
-                # Hash the prompt so repeated prompts cannot cross the split.
-                prompt = conversation[0].get("value", conversation[0].get("content", ""))
-                digest = hashlib.sha256(prompt.encode()).digest()
-                split = "validation" if int.from_bytes(digest[:4], "big") % 100 == 0 else "train"
+                split = conversation_split(conversation)
                 rows[split].append(encoded)
                 stats[f"{split}_samples"] += 1
                 if split == "train":
@@ -107,19 +101,29 @@ def prepare_shard(job):
     return file, stats
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path("outputs/maple_idlm"))
-    parser.add_argument("--shards", type=int, default=120)
-    parser.add_argument("--max-length", type=int, default=4096)
-    parser.add_argument("--workers", type=int, default=1)
-    args = parser.parse_args()
-    if not 1 <= args.shards <= 120:
-        parser.error("--shards must be between 1 and 120")
-    args.root.mkdir(parents=True, exist_ok=True)
-    model_dir = args.root / "model"
-    patterns = ["*.json", "*.jinja", "*.txt", "*.safetensors", "LICENSE", "README.md"]
-    snapshot_download(MODEL_ID, revision=MODEL_REVISION, local_dir=model_dir, allow_patterns=patterns, max_workers=4)
+def prepare_data(args):
+    model_dir = args.model_path.resolve() if args.model_path else args.root / "model"
+    model_revision = local_model_revision(model_dir) if args.model_path else MODEL_REVISION
+    manifest = {
+        "model": str(model_dir) if args.model_path else MODEL_ID,
+        "model_path": str(model_dir.resolve()),
+        "model_revision": model_revision,
+        "ternary_scheme": args.ternary_scheme,
+        "dataset": DATA_ID,
+        "dataset_revision": DATA_REVISION,
+        "paper_corpus": False,
+        "max_length": args.max_length,
+        "requested_shards": args.shards,
+        "tokenization": args.tokenization,
+    }
+    validate_preparation_root(args.root, manifest)
+    # Tokenization needs only metadata; let a concurrent weight download finish
+    # while the CPU workers prepare data. The final manifest still requires both.
+    patterns = ["*.json", "*.jinja", "*.txt", "LICENSE", "README.md"]
+    if not args.model_path:
+        snapshot_download(
+            MODEL_ID, revision=MODEL_REVISION, local_dir=model_dir, allow_patterns=patterns, max_workers=4
+        )
     # The original config omits model_type, which triggers v5's Mistral heuristic.
     # Maple uses Qwen2 tokenization; preserve the pinned pretokenizer unchanged.
     tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=False, fix_mistral_regex=False)
@@ -130,21 +134,12 @@ def main():
     if len(tokenizer) > model_config["vocab_size"]:
         raise ValueError("Maple tokenizer has no unused vocabulary row for MASK")
     tokenizer.save_pretrained(args.root / "tokenizer")
-    model_config.update(model_type="maple", mask_token_id=tokenizer.mask_token_id)
+    model_config.update(model_type="maple", mask_token_id=tokenizer.mask_token_id, ternary_scheme=args.ternary_scheme)
     model_config.pop("auto_map", None)
     config_dir = args.root / "config"
     config_dir.mkdir(exist_ok=True)
     (config_dir / "config.json").write_text(json.dumps(model_config, indent=2) + "\n")
-    manifest = {
-        "model": MODEL_ID,
-        "model_revision": MODEL_REVISION,
-        "dataset": DATA_ID,
-        "dataset_revision": DATA_REVISION,
-        "paper_corpus": False,
-        "mask_token_id": tokenizer.mask_token_id,
-        "max_length": args.max_length,
-        "requested_shards": args.shards,
-    }
+    manifest["mask_token_id"] = tokenizer.mask_token_id
     (args.root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     files = [f"data/train-{i:05d}-of-00120.parquet" for i in range(args.shards)]
     snapshot_download(
@@ -155,20 +150,65 @@ def main():
         allow_patterns=files + ["README.md"],
         max_workers=4,
     )
-    print("Pinned snapshots downloaded", flush=True)
-    stats = {"train_samples": 0, "train_tokens": 0, "validation_samples": 0, "skipped": 0}
-    with ProcessPoolExecutor(
-        max_workers=args.workers,
-        mp_context=multiprocessing.get_context("spawn"),
-        initializer=init_worker,
-        initargs=(str(args.root / "tokenizer"),),
-    ) as pool:
-        for file, counts in pool.map(prepare_shard, [(args.root, file, args.max_length) for file in files]):
-            for key, value in counts.items():
-                stats[key] += value
-            print(json.dumps({"prepared": file, **stats}), flush=True)
-    manifest.update(stats)
+    print("Pinned tokenizer and dataset downloaded", flush=True)
+    if args.tokenization == "online":
+        from veomni.data.maple import raw_shard_identity
+
+        manifest["raw_shards"] = raw_shard_identity(args.root, args.shards)
+        metadata = [pq.ParquetFile(args.root / "raw" / file).metadata for file in files]
+        manifest["raw_samples"] = sum(item.num_rows for item in metadata)
+        manifest["raw_uncompressed_bytes"] = sum(
+            item.row_group(index).total_byte_size for item in metadata for index in range(item.num_row_groups)
+        )
+    else:
+        stats = {"train_samples": 0, "train_tokens": 0, "validation_samples": 0, "skipped": 0}
+        with ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=init_worker,
+            initargs=(str(args.root / "tokenizer"),),
+        ) as pool:
+            for file, counts in pool.map(
+                prepare_shard, [(args.root, file, args.max_length, model_revision) for file in files]
+            ):
+                for key, value in counts.items():
+                    stats[key] += value
+                print(json.dumps({"prepared": file, **stats}), flush=True)
+        manifest.update(stats)
+    if args.model_path:
+        if local_model_revision(model_dir) != model_revision:
+            raise ValueError("Local checkpoint changed during preparation; choose an immutable model directory")
+    else:
+        snapshot_download(
+            MODEL_ID, revision=MODEL_REVISION, local_dir=model_dir, allow_patterns=["*.safetensors"], max_workers=4
+        )
+    manifest["data_ready"] = True
     (args.root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path("outputs/maple_idlm"))
+    parser.add_argument(
+        "--model-path", type=Path, help="Reuse a local indexed Maple checkpoint without downloading weights"
+    )
+    parser.add_argument("--ternary-scheme", choices=("group_absmax", "row_twn"), default="group_absmax")
+    parser.add_argument(
+        "--tokenization", choices=("online", "offline"), default="offline", help="Online tokenizes in training workers"
+    )
+    parser.add_argument("--shards", type=int, default=120)
+    parser.add_argument("--max-length", type=int, default=4096)
+    parser.add_argument("--workers", type=int, default=1)
+    args = parser.parse_args()
+    if not 1 <= args.shards <= 120:
+        parser.error("--shards must be between 1 and 120")
+    if args.max_length < 2 or args.workers < 1:
+        parser.error("--max-length must be at least 2 and --workers must be positive")
+    args.root.mkdir(parents=True, exist_ok=True)
+    # The launcher uses the same lock: never replace data beneath a live run.
+    with (args.root / "supervisor.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        prepare_data(args)
 
 
 if __name__ == "__main__":

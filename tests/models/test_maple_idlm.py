@@ -1,7 +1,7 @@
 import copy
 import runpy
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -18,11 +18,22 @@ from veomni.models.transformers.maple.runtime import (
     prepare_idlm_inputs,
 )
 from veomni.ops.qat.ternary import ternary_fake_quant_weight, ternary_linear
+from veomni.utils.import_utils import is_quack_gemm_available
 
+from ..tools.launch_utils import find_free_port
 from ..tools.training_utils import make_eager_ops_config
 
 
-def make_model(*, gpu=False, fused=False):
+MOE_BACKENDS = [
+    "fused_triton",
+    pytest.param(
+        "fused_quack",
+        marks=pytest.mark.skipif(not is_quack_gemm_available(), reason="Quack requires SM90+ and the quack package"),
+    ),
+]
+
+
+def make_model(*, gpu=False, fused=False, ternary_scheme="group_absmax", moe_backend="fused_triton"):
     config = MapleConfig(
         vocab_size=256 if gpu else 32,
         hidden_size=128 if gpu else 16,
@@ -34,6 +45,7 @@ def make_model(*, gpu=False, fused=False):
         num_experts_per_tok=2,
         moe_intermediate_size=128 if gpu else 16,
         ternary_group_size=8,
+        ternary_scheme=ternary_scheme,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=2,
         idlm_enabled=True,
@@ -44,7 +56,7 @@ def make_model(*, gpu=False, fused=False):
     if fused:
         overrides.update(
             attn_implementation="flex_attention",
-            moe_implementation="fused_triton",
+            moe_implementation=moe_backend,
             cross_entropy_loss_implementation="liger_kernel",
             rms_norm_implementation="liger_kernel",
         )
@@ -61,10 +73,83 @@ def make_model(*, gpu=False, fused=False):
     return model
 
 
+def legacy_maple_state_dict(state):
+    """Independent inverse of the checkpoint converter for migration fixtures."""
+    result = {}
+    for name, value in state.items():
+        if name.endswith(".experts.gate_up_proj"):
+            prefix = name.removesuffix("gate_up_proj")
+            for expert, rows in enumerate(value):
+                gate, up = rows.chunk(2, dim=0)
+                result[f"{prefix}{expert}.gate_proj.weight"] = gate.clone()
+                result[f"{prefix}{expert}.up_proj.weight"] = up.clone()
+        elif name.endswith(".experts.down_proj"):
+            prefix = name.removesuffix("down_proj")
+            for expert, rows in enumerate(value):
+                result[f"{prefix}{expert}.down_proj.weight"] = rows.clone()
+        else:
+            result[name] = value.clone()
+    return result
+
+
+def legacy_maple_moe_forward(self, hidden_states):
+    indices, weights, router_logits = self.gate(hidden_states)
+    flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+    output = torch.zeros_like(flat, dtype=torch.float32)
+    for expert_id, expert in enumerate(self.experts):
+        tokens, slots = torch.where(indices == expert_id)
+        output = output.index_add(0, tokens, expert(flat[tokens]).float() * weights[tokens, slots, None])
+    return output.to(flat.dtype).reshape_as(hidden_states), router_logits
+
+
+@pytest.mark.parametrize(
+    "gpu", [False, pytest.param(True, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))]
+)
+@pytest.mark.parametrize("ternary_scheme", ["group_absmax", "row_twn"])
+def test_packed_experts_match_legacy_model_loss_and_gradients(gpu, ternary_scheme):
+    from veomni.models.checkpoint_tensor_loading import get_checkpoint_tensor_converter
+    from veomni.models.transformers.maple.generated.patched_modeling_maple_gpu import MapleMLP
+
+    torch.manual_seed(93)
+    actual = make_model(gpu=gpu, ternary_scheme=ternary_scheme).train()
+    legacy = copy.deepcopy(actual)
+    for layer in legacy.model.layers:
+        weight = layer.mlp.experts.gate_up_proj
+        layer.mlp.experts = nn.ModuleList(
+            MapleMLP(actual.config, actual.config.moe_intermediate_size).to(device=weight.device, dtype=weight.dtype)
+            for _ in range(actual.config.num_experts)
+        )
+        layer.mlp.forward = MethodType(legacy_maple_moe_forward, layer.mlp)
+    legacy.load_state_dict(legacy_maple_state_dict(actual.state_dict()), strict=True)
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6]], device=next(actual.parameters()).device)
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        expected = legacy(input_ids=ids, labels=ids).loss
+        observed = actual(input_ids=ids, labels=ids).loss
+        torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+        expected.backward()
+        observed.backward()
+    converter = get_checkpoint_tensor_converter(actual)
+    expected_grads = {}
+    for name, param in legacy.named_parameters():
+        assert param.grad is not None, name
+        converted = converter.convert(name, param.grad)
+        if converted is not None:
+            expected_grads[converted.name] = converted.tensor
+    assert converter.finalize() == []
+    for name, param in actual.named_parameters():
+        # Packed slices change autograd's accumulation order, including the
+        # gradient entering the residual stream. Bound BF16 rounding separately
+        # from FP32; forward loss and checkpoint tensor conversion stay exact.
+        expected_grad = expected_grads[name].float()
+        error = (param.grad.float() - expected_grad).norm()
+        scale = expected_grad.norm().clamp_min(1e-12)
+        assert error / scale < (0.02 if gpu else 1e-6), (name, float(error / scale))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Maple inference runtime uses CUDA kernels")
 @pytest.mark.parametrize("attention", ["flex_attention", "sdpa"])
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_inference_runtime_roundtrip_and_cleanup(tmp_path, monkeypatch, free_tcp_port, attention, interrupt):
+def test_inference_runtime_roundtrip_and_cleanup(tmp_path, monkeypatch, attention, interrupt):
     import torch.distributed as dist
 
     from veomni.distributed.parallel_state import is_parallel_state_initialized
@@ -72,7 +157,7 @@ def test_inference_runtime_roundtrip_and_cleanup(tmp_path, monkeypatch, free_tcp
 
     for name, value in {
         "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": str(free_tcp_port),
+        "MASTER_PORT": str(find_free_port()),
         "RANK": "0",
         "LOCAL_RANK": "0",
         "WORLD_SIZE": "1",
@@ -145,9 +230,99 @@ def test_training_backward_checkpointing_and_roundtrip(tmp_path):
     reloaded.eval()
     model.eval()
     torch.testing.assert_close(reloaded(input_ids=ids).logits, model(input_ids=ids).logits)
-    assert "model.layers.0.mlp.experts.0.gate_proj.weight" in reloaded.state_dict()
+    assert "model.layers.0.mlp.experts.gate_up_proj" in reloaded.state_dict()
+    assert reloaded.config.expert_weight_layout == "packed_gate_up"
     result = introspective_generate(reloaded, ids, mask_token_id=31, max_new_tokens=4)
     assert result.sequences.shape == (1, 10)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_maple_hf_loader_preserves_complete_packed_weights(tmp_path, legacy):
+    from veomni.models.checkpoint_tensor_loading import get_checkpoint_tensor_converter
+    from veomni.models.module_utils import load_model_weights
+
+    reference = make_model().eval()
+    state = reference.state_dict()
+    source = legacy_maple_state_dict(state) if legacy else state
+    reference.save_pretrained(tmp_path, state_dict=dict(source), max_shard_size="5KB")
+    actual = make_model().eval()
+    load_model_weights(actual, str(tmp_path), init_device="cpu")
+    for name, tensor in actual.state_dict().items():
+        torch.testing.assert_close(tensor, state[name], atol=0, rtol=0, msg=name)
+    # The base MapleModel must register the same converter, without a model. prefix.
+    base_converter = get_checkpoint_tensor_converter(actual.model)
+    for name, tensor in actual.model.state_dict().items():
+        assert base_converter.convert(name, tensor).tensor is tensor
+    assert base_converter.finalize() == []
+    from veomni.models.checkpoint_tensor_loading import resolve_fqn_to_index_mapping_for_save
+    from veomni.utils.save_safetensor_utils import get_model_save_state
+
+    mapping = resolve_fqn_to_index_mapping_for_save(actual, dict.fromkeys(source, 1))
+    exported = get_model_save_state(actual, mapping)
+    assert exported.keys() == state.keys()
+    for name, tensor in exported.items():
+        torch.testing.assert_close(tensor, state[name].to(torch.bfloat16), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("include_lm_head", [False, True])
+@pytest.mark.parametrize("init_device", ["meta", "cpu"])
+def test_maple_tied_hf_weights_load_from_meta(tmp_path, include_lm_head, init_device):
+    from safetensors.torch import save_file
+
+    from veomni.models.module_utils import load_model_weights
+
+    reference = make_model().eval()
+    reference.config.tie_word_embeddings = True
+    reference.tie_weights()
+    reference.save_pretrained(tmp_path)
+    if include_lm_head:
+        # DCP exports preserve both tied names, unlike save_pretrained.
+        save_file(
+            {name: tensor.clone() for name, tensor in reference.state_dict().items()}, tmp_path / "model.safetensors"
+        )
+    actual = build_foundation_model(
+        reference.config,
+        init_device="meta",
+        torch_dtype="float32",
+        ops_implementation=make_eager_ops_config(qat_implementation="ternary"),
+    )
+    if init_device == "cpu":
+        actual.to_empty(device="cpu")
+        actual.tie_weights()
+    load_model_weights(actual, str(tmp_path), init_device="cpu")
+    assert actual.lm_head.weight is actual.model.word_embeddings.weight
+    for name, tensor in actual.state_dict().items():
+        torch.testing.assert_close(tensor, reference.state_dict()[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("idlm_enabled", [False, True])
+def test_token_weighted_microbatches_match_packed_loss_and_gradients(idlm_enabled):
+    """VeOmni weights losses by unshifted response counts across microbatches/ranks."""
+    torch.manual_seed(42)
+    model = make_model().train()
+    model.config.idlm_enabled = idlm_enabled
+    model.config.idlm_block_size = 2
+    packed_model = copy.deepcopy(model)
+    inputs = [torch.tensor([[1, 2, 3, 4]]), torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12, 13]])]
+    labels = [ids.clone() for ids in inputs]
+    for targets in labels:
+        targets[:, :2] = -100
+    counts = [(targets != -100).sum() for targets in labels]
+    total = sum(counts)
+    accumulated = sum(
+        model(input_ids=ids, labels=targets).loss * count / total
+        for ids, targets, count in zip(inputs, labels, counts)
+    )
+    accumulated.backward()
+    packed = packed_model(
+        input_ids=torch.cat(inputs, dim=-1),
+        labels=torch.cat(labels, dim=-1),
+        position_ids=torch.cat([torch.arange(ids.shape[-1]) for ids in inputs])[None],
+    ).loss
+    packed.backward()
+    torch.testing.assert_close(accumulated, packed, atol=1e-6, rtol=1e-6)
+    for (name, observed), (_, expected) in zip(model.named_parameters(), packed_model.named_parameters()):
+        torch.testing.assert_close(observed.grad, expected.grad, atol=1e-6, rtol=1e-5, msg=name)
 
 
 def test_new_mask_initialization_preserves_existing_tokens():
@@ -167,7 +342,8 @@ def test_new_mask_initialization_preserves_existing_tokens():
             torch.testing.assert_close(value, previous[name], atol=0, rtol=0)
 
 
-def test_dcp_export_keeps_registered_config_tokenizer_and_trained_mask(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_dcp_export_keeps_registered_config_tokenizer_and_trained_mask(tmp_path, monkeypatch, legacy):
     import torch.distributed.checkpoint as dcp
     from safetensors.torch import load_file
     from tokenizers import Tokenizer
@@ -196,6 +372,9 @@ def test_dcp_export_keeps_registered_config_tokenizer_and_trained_mask(tmp_path,
     tokenizer.chat_template = "{{ messages[0]['content'] }}"
     tokenizer.save_pretrained(assets)
     state = {name: tensor.to(torch.bfloat16) for name, tensor in model.state_dict().items()}
+    expected_packed = state
+    if legacy:
+        state = legacy_maple_state_dict(state)
     dcp.save({"model": state}, checkpoint_id=checkpoint)
     merge = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/merge_dcp_to_hf.py"))
     merge["merge_to_hf_pt"](str(checkpoint), str(exported), str(assets))
@@ -209,6 +388,21 @@ def test_dcp_export_keeps_registered_config_tokenizer_and_trained_mask(tmp_path,
     assert restored.keys() == state.keys()
     for name, tensor in state.items():
         torch.testing.assert_close(restored[name], tensor, atol=0, rtol=0)
+    from veomni.models.module_utils import load_model_weights
+
+    reloaded = make_model().to(torch.bfloat16)
+    load_model_weights(reloaded, str(exported), init_device="cpu")
+    for name, tensor in reloaded.state_dict().items():
+        torch.testing.assert_close(tensor, expected_packed[name], atol=0, rtol=0)
+
+
+def test_legacy_dcp_requires_explicit_weights_migration(tmp_path):
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    model = make_model()
+    dcp.save({"model": legacy_maple_state_dict(model.state_dict())}, checkpoint_id=tmp_path)
+    with pytest.raises(CheckpointException, match="Missing key"):
+        dcp.load({"model": model.state_dict()}, checkpoint_id=tmp_path)
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -421,9 +615,11 @@ def cuda_parallel(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel parity")
 @pytest.mark.parametrize("block_size", [1, 3])
 @pytest.mark.parametrize("attention", ["flex_attention", "sdpa"])
-def test_cuda_training_kernels_match_reference(block_size, attention, cuda_parallel):
+@pytest.mark.parametrize("ternary_scheme", ["group_absmax", "row_twn"])
+@pytest.mark.parametrize("moe_backend", MOE_BACKENDS)
+def test_cuda_training_kernels_match_reference(block_size, attention, ternary_scheme, moe_backend, cuda_parallel):
     torch.manual_seed(19)
-    reference = make_model(gpu=True).train()
+    reference = make_model(gpu=True, ternary_scheme=ternary_scheme).train()
     reference.config.idlm_block_size = block_size
     reference_routes = []
     for layer in reference.model.layers:
@@ -442,7 +638,7 @@ def test_cuda_training_kernels_match_reference(block_size, attention, cuda_paral
     with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
         expected_output = reference(input_ids=ids, labels=labels, position_ids=positions, attention_mask=valid)
         expected_output.loss.backward()
-    actual = make_model(gpu=True, fused=True).train()
+    actual = make_model(gpu=True, fused=True, ternary_scheme=ternary_scheme, moe_backend=moe_backend).train()
     actual.config._attn_implementation = attention
     actual.load_state_dict(reference.state_dict())
     actual.config.idlm_block_size = block_size
@@ -473,14 +669,18 @@ def test_cuda_training_kernels_match_reference(block_size, attention, cuda_paral
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA MoE parity")
-def test_cuda_moe_forward_and_backward_with_native_routing(cuda_parallel):
+@pytest.mark.parametrize("moe_backend", MOE_BACKENDS)
+@pytest.mark.parametrize("ternary_scheme", ["group_absmax", "row_twn"])
+def test_cuda_moe_forward_and_backward_with_native_routing(moe_backend, ternary_scheme, cuda_parallel):
     torch.manual_seed(17)
-    reference = make_model(gpu=True).model.layers[0].mlp
+    reference = make_model(gpu=True, ternary_scheme=ternary_scheme).model.layers[0].mlp
     inputs = torch.randn(1, 96, 128, device="cuda", dtype=torch.bfloat16).requires_grad_()
     gradient = torch.randn_like(inputs)
     expected = reference(inputs)[0]
     expected.backward(gradient)
-    actual = make_model(gpu=True, fused=True).model.layers[0].mlp
+    actual = (
+        make_model(gpu=True, fused=True, ternary_scheme=ternary_scheme, moe_backend=moe_backend).model.layers[0].mlp
+    )
     actual.load_state_dict(reference.state_dict())
     actual_inputs = inputs.detach().clone().requires_grad_()
     output = actual(actual_inputs)[0]
@@ -541,6 +741,118 @@ def test_single_gpu_offload_accumulates_the_reference_gradients(cuda_parallel, t
         torch.testing.assert_close(expected.grad, local, atol=0.002, rtol=0.02, msg=name)
 
 
+def _fsdp2_token_weighting_worker(weights_path, ternary_scheme, async_offload):
+    import torch.distributed as dist
+
+    from veomni.arguments import AcceleratorConfig
+    from veomni.arguments.arguments_types import MixedPrecisionConfig
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.models.transformers.maple.runtime import initialize_mask_token
+
+    init_parallel_state_from_config(AcceleratorConfig(), name="base")
+    try:
+        torch.manual_seed(21)
+        reference = make_model(ternary_scheme=ternary_scheme).to("cuda").train()
+        if dist.get_rank() == 0:
+            # Exercise the legacy-to-packed converter inside distributed loading.
+            reference.save_pretrained(weights_path, state_dict=legacy_maple_state_dict(reference.state_dict()))
+        dist.barrier()
+        actual = build_foundation_model(
+            reference.config,
+            torch_dtype="float32",
+            init_device="meta",
+            ops_implementation=make_eager_ops_config(qat_implementation="ternary"),
+        )
+        if async_offload:
+            from veomni.distributed.async_offload import apply_async_activation_offload
+
+            apply_async_activation_offload(actual, [], host_cache_limit_bytes=16 * 1024**2)
+        actual = build_parallelize_model(
+            actual,
+            weights_path=weights_path,
+            init_device="meta",
+            mixed_precision=MixedPrecisionConfig(enable=False),
+            enable_gradient_checkpointing=True,
+            basic_modules=["MapleDecoderLayer"],
+        )
+        for (name, expected), (_, observed) in zip(reference.named_parameters(), actual.named_parameters()):
+            torch.testing.assert_close(expected, observed.full_tensor(), atol=0, rtol=0, msg=name)
+        initialize_mask_token(reference, 31)
+        initialize_mask_token(actual, 31)
+        batches = [torch.tensor([[1, 2, 3, 4]], device="cuda"), torch.tensor([[5, 6, 7, 8, 9, 10]], device="cuda")]
+        targets = [ids.clone() for ids in batches]
+        for labels in targets:
+            labels[:, :2] = -100
+        counts = [(labels != -100).sum() for labels in targets]
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            expected_loss = sum(
+                reference(input_ids=ids, labels=labels).loss * count / sum(counts)
+                for ids, labels, count in zip(batches, targets, counts)
+            )
+            expected_loss.backward()
+            rank = dist.get_rank()
+            loss = actual(input_ids=batches[rank], labels=targets[rank]).loss
+            (loss * counts[rank] / sum(counts) * dist.get_world_size()).backward()
+        for (name, expected), (_, observed) in zip(reference.named_parameters(), actual.named_parameters()):
+            torch.testing.assert_close(expected.grad, observed.grad.full_tensor(), atol=1e-6, rtol=1e-4, msg=name)
+        if async_offload:
+            manager = actual.model.layers[0]._veomni_offload_manager
+            assert manager.host_buffer_pool.allocations > 0
+            assert not manager.items
+        # Packed weights-only DCP must round-trip on the same FSDP2 topology.
+        checkpoint = str(Path(weights_path).parent / "packed_dcp")
+        saved_weights = {name: param.full_tensor().clone() for name, param in actual.named_parameters()}
+        state = actual.state_dict()
+        dcp.save({"model": state}, checkpoint_id=checkpoint)
+        with torch.no_grad():
+            for param in actual.parameters():
+                param.zero_()
+        dcp.load({"model": state}, checkpoint_id=checkpoint)
+        actual.load_state_dict(state, strict=True)
+        for name, observed in actual.named_parameters():
+            torch.testing.assert_close(saved_weights[name], observed.full_tensor(), atol=0, rtol=0, msg=name)
+    finally:
+        clear_parallel_state()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices are required for FSDP2 parity")
+@pytest.mark.parametrize("ternary_scheme", ["group_absmax", "row_twn"])
+@pytest.mark.parametrize("async_offload", [False, True])
+def test_two_gpu_fsdp2_response_weighting_and_mask_initialization(tmp_path, ternary_scheme, async_offload):
+    from ..tools.launch_utils import torchrun
+
+    torchrun(_fsdp2_token_weighting_worker, 2, str(tmp_path / "weights"), ternary_scheme, async_offload)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA activation offload")
+@pytest.mark.parametrize("ternary_scheme", ["group_absmax", "row_twn"])
+@pytest.mark.parametrize("moe_backend", MOE_BACKENDS)
+def test_maple_async_activation_offload_preserves_fused_gradients(ternary_scheme, moe_backend, cuda_parallel):
+    from veomni.distributed.async_offload import apply_async_activation_offload
+
+    torch.manual_seed(56)
+    reference = make_model(gpu=True, fused=True, ternary_scheme=ternary_scheme, moe_backend=moe_backend).train()
+    reference.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    actual = copy.deepcopy(reference)
+    apply_async_activation_offload(actual, [], host_cache_limit_bytes=16 * 1024**2)
+    ids = torch.randint(1, 30, (1, 96), device="cuda")
+    for _ in range(2):
+        reference.zero_grad(set_to_none=True)
+        actual.zero_grad(set_to_none=True)
+        expected = reference(input_ids=ids, labels=ids).loss
+        expected.backward()
+        observed = actual(input_ids=ids, labels=ids).loss
+        observed.backward()
+        torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+        for (name, expected_param), (_, actual_param) in zip(reference.named_parameters(), actual.named_parameters()):
+            torch.testing.assert_close(actual_param.grad, expected_param.grad, atol=0, rtol=0, msg=name)
+    manager = actual.model.layers[0]._veomni_offload_manager
+    assert manager.host_buffer_pool.allocations > 0
+    assert manager.host_buffer_pool.reuses > 0
+    assert not manager.items
+
+
 @pytest.mark.parametrize("block", [1, 2, 3])
 @pytest.mark.parametrize("window", [None, 2])
 def test_idlm_visibility_matches_independent_prefix_construction(block, window):
@@ -561,6 +873,58 @@ def test_idlm_visibility_matches_independent_prefix_construction(block, window):
                 else:
                     expected[offset + i, offset + j] = True
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("block", [1, 2, 3, 257])
+@pytest.mark.parametrize("window", [None, 0, 2, 129])
+def test_idlm_sparse_tiles_preserve_all_token_visibility(block, window):
+    positions = torch.stack(
+        [torch.cat([torch.arange(n) for n in lengths]) for lengths in [(384, 128, 1), (3, 385, 125)]]
+    )
+    valid = torch.ones_like(positions, dtype=torch.bool)
+    valid[0, -5:] = False
+    valid[1, [7, 300]] = False
+    expected = make_idlm_attention_mask(positions, valid, block, sliding_window=window)
+    sparse = make_idlm_attention_mask(positions, valid, block, sliding_window=window, flex=True)
+
+    def dense_tiles(counts, indices):
+        active = torch.arange(indices.shape[-1]) < counts[..., None]
+        return torch.zeros_like(indices, dtype=torch.bool).scatter(-1, indices.long(), active)
+
+    partial = dense_tiles(sparse.kv_num_blocks, sparse.kv_indices)
+    full = dense_tiles(sparse.full_kv_num_blocks, sparse.full_kv_indices)
+    assert not (partial & full).any()
+    length = expected.shape[-1]
+    expanded_partial = partial.repeat_interleave(128, -2).repeat_interleave(128, -1)[..., :length, :length]
+    expanded_full = full.repeat_interleave(128, -2).repeat_interleave(128, -1)[..., :length, :length]
+    assert not (expanded_full & ~expected).any(), "A full tile must not bypass a masked token pair"
+    assert torch.equal((expanded_partial & expected) | expanded_full, expected)
+    if block == 1 and window is None:
+        assert full.any(), "Interior clean-prefix tiles should bypass token masking"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FlexAttention parity")
+@pytest.mark.parametrize("block, window", [(1, None), (3, 2), (257, 129)])
+def test_idlm_sparse_tiles_match_dense_attention_and_gradients(block, window):
+    from torch.nn.attention.flex_attention import flex_attention
+
+    torch.manual_seed(37)
+    positions = torch.cat([torch.arange(n) for n in (385, 65, 63)])[None].cuda()
+    valid = torch.ones_like(positions, dtype=torch.bool)
+    valid[:, -7:] = False
+    dense = make_idlm_attention_mask(positions, valid, block, sliding_window=window)
+    sparse = make_idlm_attention_mask(positions, valid, block, sliding_window=window, flex=True)
+    inputs = [torch.randn(1, 2, 1026, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    upstream = torch.randn_like(inputs[0])
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        expected = torch.nn.functional.scaled_dot_product_attention(*inputs, attn_mask=dense)
+    expected_grads = torch.autograd.grad(expected, inputs, upstream)
+    actual = torch.compile(flex_attention)(*inputs, block_mask=sparse)
+    actual_grads = torch.autograd.grad(actual, inputs, upstream)
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+    for observed, reference in zip(actual_grads, expected_grads):
+        relative_error = (observed.float() - reference.float()).norm() / reference.float().norm().clamp_min(1e-7)
+        assert relative_error < 0.02
 
 
 def test_shift_does_not_leak_across_documents_and_preserves_prompt():

@@ -154,6 +154,11 @@ Checkpointing is split three ways, mirroring SeedOmni V2's `OmniModuleDcpCallbac
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()` / `save_model_assets()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.
 - **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. A multi-module model subclasses it and sets `module_name`; every path then nests one level deeper via `veomni/checkpoint/layout.py`.
 
+`train.checkpoint.save_optimizer` and `load_optimizer` default to `true`.
+For DCP, disabling them omits optimizer tensors on save and leaves a fresh
+optimizer on load while preserving weights and small progress/scheduler
+sidecars. This saves disk space but does not reproduce a full optimizer resume.
+
 Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles `state_dict` into a single `model/lr_scheduler.pt`; rank 0 writes, every rank reads). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 
 Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction: iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` (`veomni/data/dataset.py:1509`), the multisource sampler filters on `_global_sample_idx % dp_size == dp_rank` (`:596`), and Energon takes `dp_rank` in its `WorkerConfig` (`:1645`). Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
@@ -303,6 +308,7 @@ both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
 | Task | Script | Trainer |
 |------|--------|---------|
 | Text SFT | `tasks/train_text.py` | `TextTrainer` |
+| Maple iDLM | `tasks/train_maple_idlm.py` | `MapleTrainer` (extends `TextTrainer`'s data-transform hook) |
 | Text DPO | `tasks/train_text_dpo.py` | `TextDPOTrainer` |
 | Text RL | `tasks/train_text_rl.py` | `BaseRLTrainer` |
 | VLM SFT | `tasks/train_vlm.py` | `VLMTrainer` |

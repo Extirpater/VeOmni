@@ -413,6 +413,40 @@ def test_unpack_swap_tensor_survives_repeated_access():
     assert second.data_ptr() == first.data_ptr()
 
 
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA streams and delayed kernels are required")
+@pytest.mark.parametrize("repeated_unpack", [False, True])
+def test_restored_activation_outlives_queued_consumer(repeated_unpack):
+    """Recycling on the transfer stream must wait for asynchronous readers."""
+    manager = OffloadManager(PinnedBufferPool(max_cached_bytes=16 << 20))
+    consumer = torch.cuda.Stream()
+    original = torch.full((1024, 1024), 3.0, device="cuda")
+    swap = SwapTensor(original, "0_0", manager.host_buffer_pool)
+    swap.launch_d2h(manager.swap_stream)
+    swap.wait_d2h_finished()
+    manager.put("0_0", swap)
+    # Prefetch from the default stream; unpack below consumes on another one.
+    swap.launch_h2d(manager.swap_stream)
+    if repeated_unpack:
+        _unpack_swap_tensor(manager, swap, prefetch=False)
+
+    with torch.cuda.stream(consumer):
+        restored = _unpack_swap_tensor(manager, swap, prefetch=False)
+        # Keep the consumer pending while the host drops all activation refs
+        # and queues an overwrite of recycled storage on its allocation stream.
+        torch.cuda._sleep(100_000_000)
+        result = restored.clone()
+    del original, restored, swap
+    recycled = []
+    for allocation_stream in (manager.swap_stream, torch.cuda.current_stream()):
+        with torch.cuda.stream(allocation_stream):
+            buffer = torch.empty((1024, 1024), device="cuda")
+            buffer.fill_(99.0)
+            recycled.append(buffer)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(result.cpu(), torch.full((1024, 1024), 3.0), atol=0, rtol=0)
+
+
 @pytest.mark.skipif(
     not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
     reason="CUDA or NPU is required for async D2H/H2D validation",

@@ -284,18 +284,23 @@ class SwapTensor:
             return
         if self.stat != "host":
             return
+        # Allocate on the calling compute stream so restored activations can
+        # reuse its released buffers. Allocating on the transfer stream can
+        # strand substantial memory there under large checkpointed workloads.
+        restored = torch.empty_strided(
+            self.size,
+            self.stride,
+            dtype=self.tensor_cpu.dtype,
+            device=self.tensor.device,
+        )
         backward_event = create_event()
+        # Record after allocation: a recycled buffer may still have earlier
+        # users on this stream, which must finish before the copy overwrites it.
         backward_event.record()
 
         with torch.no_grad():
             with switch_to_specified_stream(h2d_stream):
                 h2d_stream.wait_event(backward_event)
-                restored = torch.empty_strided(
-                    self.size,
-                    self.stride,
-                    dtype=self.tensor_cpu.dtype,
-                    device=self.tensor.device,
-                )
                 restored.copy_(self.tensor_cpu, non_blocking=True)
                 self.tensor.set_(restored.untyped_storage(), 0, self.size, self.stride)
                 self.h2d_event.record()
@@ -408,7 +413,13 @@ def _unpack_swap_tensor(manager, swap_tensor, *, prefetch: bool) -> torch.Tensor
     h2d_stream = manager.swap_stream
     swap_tensor.launch_h2d(h2d_stream)
 
-    get_current_stream().wait_event(swap_tensor.h2d_event)
+    consumer_stream = get_current_stream()
+    consumer_stream.wait_event(swap_tensor.h2d_event)
+    # Prefetch may allocate on a different stream from this consumer. The wait
+    # orders the copy before reads, but does not keep storage alive for queued
+    # reads after autograd releases the tensor. Track every consumer, including
+    # repeated unpack on another stream, before the allocator can recycle it.
+    swap_tensor.tensor.record_stream(consumer_stream)
     swap_tensor.release_host_buffer()
     swap_tensor.stat = "device"
 

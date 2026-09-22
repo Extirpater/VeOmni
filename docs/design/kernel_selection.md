@@ -28,12 +28,18 @@ selection knob.
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
-| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
+| QAT recipe | `qat_implementation` | `none`, `ternary` (Maple), `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
 
 The last row is the one field that is not a kernel backend: `qat_implementation`
 selects a fake-quantization recipe, so it has no `OpSlot` and no per-model
 variants. `fp8_blockwise` is rejected at config-parse time on anything but an
 SM90+ NVIDIA CUDA GPU.
+
+Maple selects its ternary math with `model.model_config.ternary_scheme`:
+`group_absmax` preserves group-scaled public ternary weights; `row_twn` applies
+the native row-wise threshold/scale recipe to latent masters. The latter keeps
+PyTorch reductions intact and compiles only CUDA pointwise work to preserve
+threshold decisions. Both use an identity straight-through gradient.
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
 equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,
@@ -391,6 +397,20 @@ raise during config validation or kernel binding.
 | `fused_triton` | Triton group-gemm | GPU, SM70+ (V100+) | Yes |
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
+
+The non-EP Quack backward gathers original token rows inside the first
+projection's weight-gradient GEMM. This avoids a temporary
+`[tokens * top_k, hidden_size]` activation copy for both split and merged
+gate/up weights. Expanded input gradients are also gathered and released before
+that GEMM. Expert weight layouts and checkpoint keys are unchanged.
+
+Merged non-EP Quack experts also fuse clamping, SwiGLU, and routing-weight
+multiplication. Backward recomputes the activation and writes the merged
+projection gradient directly, avoiding saved clamp masks, activation tensors,
+and a separate gradient concatenation. The kernels retain the intermediate
+BF16/FP16 rounding points of the unfused sequence. Clamp derivatives include
+the boundary, and router gradients reduce the rounded activation-gradient
+products. This is internal to `fused_quack`; no extra configuration is needed.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` indexer and attention implementations. Its MoE path

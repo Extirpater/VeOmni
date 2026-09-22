@@ -2382,6 +2382,26 @@ class TestStageDirValidation:
 
         assert [call.kwargs["slot"] for call in execute_save.call_args_list] == ["ckpt"]
 
+    def test_weights_only_rewrite_drains_optimizer_before_removal(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        optimizer = tmp_path / "global_step_10/model/optimizer"
+        optimizer.mkdir(parents=True)
+        # Simulate the previous async save publishing its marker when drained.
+        future = MagicMock()
+        future.result.side_effect = lambda: (optimizer / ".metadata").write_text("old optimizer")
+        with (
+            patch.object(DistributedCheckpointer, "_save_futures", {"optimizer": future}),
+            patch.object(DistributedCheckpointer, "_async_process_groups", {}),
+            patch.object(DistributedCheckpointer, "execute_save"),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            DistributedCheckpointer.save(str(tmp_path), {"model": MagicMock()}, global_steps=10)
+        future.result.assert_called_once()
+        assert not optimizer.exists()
+
     def test_preparation_reduces_on_the_group_it_is_handed(self, tmp_path):
         """The staging directory's agreement belongs on the stage group like the promotion's."""
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir

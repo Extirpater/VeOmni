@@ -179,6 +179,54 @@ class TestQuackFusedMoe:
         torch.testing.assert_close(fc1_q.grad, fc1_eager_grad, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("freeze_fc1", [False, True])
+def test_backward_with_empty_experts_and_frozen_projections(merged, freeze_fc1):
+    from veomni.ops.kernels.moe.quack_gemm import quack_gemm_fused_moe_forward
+
+    torch.manual_seed(73)
+    device = get_device_type()
+    dtype = torch.bfloat16
+    tokens, experts, hidden, intermediate, topk = 127, 8, 128, 64, 2
+    # Leave two experts empty and preserve nonuniform, non-tile-aligned K sizes.
+    scores, selected = torch.randn(tokens, experts - 2, device=device).softmax(-1).topk(topk)
+    inputs = [
+        torch.randn(tokens, hidden, device=device, dtype=dtype) * 0.1,
+        scores.to(dtype),
+        torch.randn(experts, intermediate, hidden, device=device, dtype=dtype) * 0.1,
+        torch.randn(experts, intermediate, hidden, device=device, dtype=dtype) * 0.1,
+        torch.randn(experts, hidden, intermediate, device=device, dtype=dtype) * 0.1,
+    ]
+    requires_grad = [True, True, not freeze_fc1, not freeze_fc1, True]
+    actual_inputs = [value.clone().requires_grad_(flag) for value, flag in zip(inputs, requires_grad)]
+    reference_inputs = [value.clone().requires_grad_(flag) for value, flag in zip(inputs, requires_grad)]
+    x, routing, gate, up, down = actual_inputs
+    actual = quack_gemm_fused_moe_forward(
+        experts,
+        routing,
+        selected,
+        x,
+        None if merged else gate,
+        None if merged else up,
+        down,
+        fc1_1_2_weight=torch.cat((gate, up), dim=1) if merged else None,
+    )
+    x, routing, gate, up, down = reference_inputs
+    expected = _eager_moe_forward(experts, routing, selected, x, gate, up, down)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
+    for actual_input, expected_input, trainable in zip(actual_inputs, reference_inputs, requires_grad):
+        if trainable:
+            torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=0.003, rtol=0.03)
+        else:
+            assert actual_input.grad is None
+    if not freeze_fc1:
+        for projection in actual_inputs[2:4]:
+            assert projection.grad[-2:].count_nonzero() == 0
+
+
 class TestBuildMoeIndices:
     """Unit tests for _build_moe_indices with concrete examples."""
 

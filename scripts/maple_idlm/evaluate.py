@@ -18,17 +18,35 @@ from veomni.utils.device import get_device_type
 
 
 def validation_sample(root, count, seed):
+    from veomni.data.maple import conversation_split, encode_conversation, raw_shard_identity
+
+    manifest = json.loads((root / "manifest.json").read_text())
+    online = manifest.get("tokenization", "offline") == "online"
+    if online and raw_shard_identity(root, manifest["requested_shards"]) != manifest["raw_shards"]:
+        raise ValueError("Raw dataset changed since preparation; prepare a new root")
     rng = random.Random(seed)
     selected, seen = [], 0
-    for path in sorted((root / "validation").glob("*.parquet")):
+    directory = root / "raw" / "data" if online else root / "validation"
+    for path in sorted(directory.glob("*.parquet")):
         for batch in pq.ParquetFile(path).iter_batches(batch_size=64):
             for row in batch.to_pylist():
+                if online and conversation_split(row.get("conversations", row.get("messages"))) != "validation":
+                    continue
                 seen += 1
                 index = len(selected) if len(selected) < count else rng.randrange(seen)
                 if len(selected) < count:
                     selected.append(row)
                 elif index < count:
                     selected[index] = row
+    if online:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer", fix_mistral_regex=False)
+        selected = [
+            encode_conversation(row.get("conversations", row.get("messages")), tokenizer, manifest["max_length"])
+            for row in selected
+        ]
+        selected = [row for row in selected if row is not None]
     return selected
 
 
@@ -45,7 +63,7 @@ def main():
     parser.add_argument("--initialize-mask", action="store_true")
     args = parser.parse_args()
     manifest = json.loads((args.data_root / "manifest.json").read_text())
-    if not manifest.get("train_samples") or args.samples < 1:
+    if not (manifest.get("data_ready") or manifest.get("train_samples")) or args.samples < 1:
         raise ValueError("Complete preparation first and request a positive sample count")
     records = validation_sample(args.data_root, args.samples, args.seed)
     if not records:

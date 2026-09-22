@@ -32,6 +32,8 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
         save_async=save_async,
         load_path=None,
         manager="dcp",
+        save_optimizer=True,
+        load_optimizer=True,
         dcp_save_to_lowest_rank=False,
         stage_dir=None,
         save_timeout_seconds=None,
@@ -84,6 +86,77 @@ def _make_mock_runtime(save_path="/tmp/test_ckpt", save_async=False):
         extra_state=MagicMock(return_value={}),
         load_extra_state=MagicMock(),
     )
+
+
+@pytest.mark.parametrize("overwrite_full_checkpoint", [False, True])
+def test_weights_only_checkpoint_roundtrip_omits_optimizer_files(tmp_path, overwrite_full_checkpoint):
+    from veomni.optim.lr_scheduler import build_lr_scheduler
+
+    runtime = _make_mock_runtime(save_path=str(tmp_path / "checkpoints"))
+    runtime.model = torch.nn.Linear(3, 2)
+    runtime.optimizer = torch.optim.AdamW(runtime.model.parameters(), lr=1e-3)
+    runtime.lr_scheduler = build_lr_scheduler(runtime.optimizer, train_steps=100, lr_warmup_ratio=0.1)
+    runtime.model(torch.ones(2, 3)).sum().backward()
+    runtime.optimizer.step()
+    runtime.lr_scheduler.step()
+    assert runtime.optimizer.state
+    runtime.train_args.checkpoint.load_optimizer = False
+    manager = ModelCheckpointManager(runtime)
+    expected = {name: tensor.clone() for name, tensor in runtime.model.state_dict().items()}
+    expected_lr = runtime.optimizer.param_groups[0]["lr"]
+    assert expected_lr > 0
+    with patch("veomni.models.checkpoint_manager.dist.barrier"):
+        if overwrite_full_checkpoint:
+            manager.save_dcp(TrainerState(global_step=7))
+        runtime.train_args.checkpoint.save_optimizer = False
+        manager.save_dcp(TrainerState(global_step=7))
+        checkpoint = tmp_path / "checkpoints/global_step_7"
+        assert (checkpoint / "model/ckpt/.metadata").is_file()
+        assert not (checkpoint / "model/optimizer").exists()
+        with torch.no_grad():
+            for parameter in runtime.model.parameters():
+                parameter.zero_()
+        runtime.optimizer = torch.optim.AdamW(runtime.model.parameters(), lr=1e-3)
+        runtime.lr_scheduler = build_lr_scheduler(runtime.optimizer, train_steps=100, lr_warmup_ratio=0.1)
+        assert runtime.optimizer.param_groups[0]["lr"] == 0
+        runtime.train_args.checkpoint.load_path = str(checkpoint)
+        manager.load()
+    assert not runtime.optimizer.state
+    assert runtime.optimizer.param_groups[0]["lr"] == expected_lr
+    for name, tensor in runtime.model.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+
+
+def test_weights_only_resume_restores_each_subscheduler_before_first_update():
+    from veomni.optim.lr_scheduler import MultiLRScheduler, build_lr_scheduler
+
+    def make_schedulers():
+        return MultiLRScheduler(
+            {
+                name: build_lr_scheduler(
+                    torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=lr),
+                    train_steps=100,
+                    lr=lr,
+                    lr_warmup_ratio=0.1,
+                )
+                for name, lr in (("experts", 0.1), ("dense", 0.2))
+            }
+        )
+
+    source = make_schedulers()
+    for scheduler in source.values():
+        scheduler.optimizer.step()
+        scheduler.step()
+    runtime = _make_mock_runtime()
+    runtime.train_args.checkpoint.load_optimizer = False
+    runtime.lr_scheduler = make_schedulers()
+    manager = ModelCheckpointManager(runtime)
+    manager._load_extra_state({"lr_scheduler": source.state_dict()})
+    for name, scheduler in runtime.lr_scheduler.items():
+        parameter = scheduler.optimizer.param_groups[0]["params"][0]
+        parameter.grad = torch.ones_like(parameter)
+        scheduler.optimizer.step()
+        torch.testing.assert_close(parameter, torch.tensor([-source[name].get_last_lr()[0]]))
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
@@ -366,6 +439,25 @@ class TestModelCheckpointManagerSaveContract:
         assert loaded["extra_state"] == {}
         assert loaded["optimizer"] is runtime.optimizer
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
+
+    def test_weights_only_save_and_reload_keep_live_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+        runtime = _make_mock_runtime()
+        runtime.train_args.checkpoint.save_optimizer = False
+        runtime.train_args.checkpoint.load_optimizer = False
+        runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
+        manager = ModelCheckpointManager(runtime)
+        original_optimizer = runtime.optimizer
+
+        manager.save_dcp(TrainerState(global_step=10))
+        saved = manager.checkpointer.save.call_args.args[1]
+        assert saved["optimizer"] is None
+        assert saved["model"] is runtime.model
+        assert "lr_scheduler" in saved["extra_state"]
+        manager.load()
+        loaded = manager.checkpointer.load.call_args.args[1]
+        assert loaded["optimizer"] is None
+        assert loaded["model"] is runtime.model
+        assert runtime.optimizer is original_optimizer
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
         self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
