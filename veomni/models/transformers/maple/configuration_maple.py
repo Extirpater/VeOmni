@@ -69,5 +69,6 @@ class MapleConfig(ReferenceMapleConfig):
                 raise ValueError("Maple supports only none or ternary QAT")
             if ops.moe_implementation not in ("eager", "fused_triton", "fused_quack"):
                 raise ValueError("Maple MoE supports eager, fused_triton, and fused_quack")
-            if ops.attn_implementation not in ("eager", "sdpa", "flex_attention", "veomni_flex_attention_with_sp"):
-                raise ValueError("Maple requires SDPA/eager reference attention or FlexAttention for I-DLM masks")
+            attention = ("eager", "sdpa", "flex_attention", "flash_attention_3")
+            if ops.attn_implementation.removeprefix("veomni_").removesuffix("_with_sp") not in attention:
+                raise ValueError("Maple requires SDPA/eager, FlexAttention, or FA3 attention for I-DLM masks")

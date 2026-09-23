@@ -88,7 +88,9 @@ def prepare_run(args):
         # Four weight copies conservatively cover both AdamW and AnyPrecision
         # states (including its compensation buffer), plus the weights.
         checkpoint_gib = weight_gib * (4 if config["train"]["checkpoint"].get("save_optimizer", True) else 1)
-        required_gib = checkpoint_gib * (keep + 1)
+        # MAPLE_PRUNE_BEFORE_SAVE lets a save replace retained checkpoints when short.
+        prune_first = os.environ.get("MAPLE_PRUNE_BEFORE_SAVE", "0") == "1"
+        required_gib = checkpoint_gib * (1 if prune_first else keep + 1)
         if online and config["data"].get("datasets_type") == "mapping":
             # HF's native map-style reader builds an Arrow cache of raw text.
             # Leave headroom for decoded columns as well as checkpoint rotation.
@@ -98,8 +100,17 @@ def prepare_run(args):
             required_gib += (remaining + 1024**3 - 1) // 1024**3
         if shutil.disk_usage(root).free < required_gib * 1024**3:
             raise ValueError(f"Need {required_gib} GiB free for Maple checkpoints and the selected data cache")
+    init = args.init_weights.resolve() if args.init_weights is not None else None
+    if init is not None:
+        # Staged training starts from an exported HF checkpoint of an earlier stage.
+        if config["train"]["checkpoint"].get("load_path"):
+            raise ValueError("--init-weights starts a new stage; it cannot be combined with resume")
+        if not (init / "config.json").is_file() or not any(init.glob("*.safetensors")):
+            raise ValueError("--init-weights must be an exported HF checkpoint directory")
+        if config["model"].get("model_config", {}).get("idlm_initialize_mask_token", True):
+            raise ValueError("--init-weights requires idlm_initialize_mask_token: false to keep trained mask rows")
     config["model"].update(
-        model_path=manifest.get("model_path", str(root / "model")),
+        model_path=str(init) if init is not None else manifest.get("model_path", str(root / "model")),
         config_path=str(root / "config"),
         tokenizer_path=str(root / "tokenizer"),
     )
@@ -132,6 +143,7 @@ def main():
     parser.add_argument("--hours", type=float, default=12)
     parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--init-weights", type=Path, help="Exported HF checkpoint to start a new stage from.")
     parser.add_argument("--fresh-window", action="store_true", help="Resume with a fresh wall-time limit.")
     args = parser.parse_args()
     if args.gpus < 1 or args.hours <= 0 or (args.steps is not None and args.steps < 1):
@@ -151,6 +163,10 @@ def main():
         os.environ["MAPLE_RUN_SECONDS"] = str(args.hours * 3600)
         os.environ.setdefault("OMP_NUM_THREADS", str(max(1, min(16, (os.cpu_count() or 1) // args.gpus))))
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        # The async allocator re-maps pool memory each step; expandable segments avoid it.
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        # Persist Quack GEMM autotuning (model.ops_implementation.moe_gemm_autotune) on disk.
+        os.environ.setdefault("QUACK_CACHE_AUTOTUNING", "1")
         # Keep the raw Arrow cache off the small root filesystem. This is set
         # before the training subprocess imports datasets.
         os.environ["HF_DATASETS_CACHE"] = str(args.root.resolve() / "dataset_cache")

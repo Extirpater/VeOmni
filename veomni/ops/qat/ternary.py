@@ -14,14 +14,16 @@ import torch.nn.functional as F
 
 class _TernarySTE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, weight, group_size, scheme):
+    def forward(ctx, weight, group_size, scheme, stats_cache=None):
         if scheme not in ("group_absmax", "row_twn"):
             raise ValueError(f"Unknown ternary scheme: {scheme}")
         if scheme == "row_twn":
-            from .ternary_twn import quantize_twn_native
+            from .ternary_twn import quantize_twn_native, quantize_twn_recompute_aware
 
             if weight.shape[-1] == 0:
                 raise ValueError("TWN requires a nonempty input dimension")
+            if stats_cache is not None:
+                return quantize_twn_recompute_aware(weight, stats_cache)
             return quantize_twn_native(weight)
         if group_size <= 0 or weight.shape[-1] % group_size:
             raise ValueError("Ternary group_size must divide the weight's input dimension")
@@ -36,12 +38,18 @@ class _TernarySTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None
+        return grad_output, None, None, None
 
 
-def ternary_fake_quant_weight(weight: torch.Tensor, group_size: int = 128, *, scheme="group_absmax") -> torch.Tensor:
-    """Apply group absmax or native Maple row-wise TWN, with identity STE."""
-    return _TernarySTE.apply(weight, group_size, scheme)
+def ternary_fake_quant_weight(
+    weight: torch.Tensor, group_size: int = 128, *, scheme="group_absmax", stats_cache=None
+) -> torch.Tensor:
+    """Apply group absmax or native Maple row-wise TWN, with identity STE.
+
+    ``stats_cache`` (a dict owned by the caller, one per weight) lets row-wise
+    TWN reuse the forward's row statistics during checkpoint recomputation.
+    """
+    return _TernarySTE.apply(weight, group_size, scheme, stats_cache)
 
 
 def ternary_linear(inputs, weight, bias=None, *, group_size=128, scheme="group_absmax", enabled=True):

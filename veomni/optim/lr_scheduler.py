@@ -59,11 +59,12 @@ def build_lr_scheduler(
     optimizer: "Optimizer",
     train_steps: int,
     lr: float = 1e-3,
-    lr_decay_style: Literal["constant", "linear", "cosine"] = "constant",
+    lr_decay_style: Literal["constant", "linear", "cosine", "wsd"] = "constant",
     lr_decay_ratio: float = 1.0,
     lr_warmup_ratio: float = 0.0,
     lr_min: float = 1e-7,
     lr_start: float = 0.0,
+    lr_wsd_decay_ratio: float = 0.2,
 ):
     # Handle MultiOptimizer by creating one scheduler per underlying optimizer
     if hasattr(optimizer, "_is_multi_optimizer") or isinstance(optimizer, dict):
@@ -78,6 +79,7 @@ def build_lr_scheduler(
                 lr_warmup_ratio=lr_warmup_ratio,
                 lr_min=lr_min,
                 lr_start=lr_start,
+                lr_wsd_decay_ratio=lr_wsd_decay_ratio,
             )
         return MultiLRScheduler(schedulers)
 
@@ -110,7 +112,49 @@ def build_lr_scheduler(
             lr_start=lr_start,
         )
 
+    if lr_decay_style == "wsd":
+        return get_wsd_schedule(
+            optimizer=optimizer,
+            num_warmup_steps=lr_warmup_steps,
+            num_training_steps=train_steps,
+            num_decay_steps=int(train_steps * lr_wsd_decay_ratio),
+            init_lr=lr,
+            min_lr=lr_min,
+            lr_start=lr_start,
+        )
+
     raise ValueError(f"Unknown learning rate decay style: {lr_decay_style}.")
+
+
+def get_wsd_schedule(
+    optimizer: "Optimizer",
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_decay_steps: int,
+    init_lr: float,
+    min_lr: float = 1e-7,
+    lr_start: float = 0.0,
+    last_epoch: int = -1,
+):
+    """Warmup-stable-decay: linear warmup, constant peak, then linear decay to ``min_lr``.
+
+    The decay occupies the final ``num_decay_steps`` updates and reaches ``min_lr``
+    at ``num_training_steps``.
+    """
+    if not 0 <= num_decay_steps <= num_training_steps - num_warmup_steps:
+        raise ValueError("WSD decay steps must fit after warmup")
+    decay_start = num_training_steps - num_decay_steps
+    min_ratio = min_lr / init_lr
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+        if current_step < decay_start:
+            return 1.0
+        progress = min(1.0, (current_step - decay_start) / max(1, num_decay_steps))
+        return 1.0 - (1.0 - min_ratio) * progress
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def get_constant_schedule_with_warmup(

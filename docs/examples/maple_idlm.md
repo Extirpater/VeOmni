@@ -47,11 +47,14 @@ revision requires a new root so stale files cannot enter training.
 activation kernels, native ternary QAT, fused AdamW with FP32 master weights,
 BF16 compute, and FSDP2 across eight GPUs. Async activation offload allows
 microbatch 20; its idle host cache is capped at 24 GiB per rank (192 GiB per node).
-In-flight host buffers are additional.
-Use the CUDA async allocator with this preset:
+In-flight host buffers are additional. The preset uses FlashAttention-3 for
+the I-DLM mask (see *Data, objective and kernels*), autotuned Quack expert GEMMs
+(`moe_gemm_autotune: true`; untuned tiles are up to 2x slower in backward), and
+eight data workers so online tokenization keeps ahead. `launch.py` defaults
+`PYTORCH_ALLOC_CONF=expandable_segments:True` and `QUACK_CACHE_AUTOTUNING=1`.
 
 ```bash
-PYTORCH_ALLOC_CONF=backend:cudaMallocAsync ./start_maple.sh \
+./start_maple.sh \
   --root "$MAPLE_ROOT" --config configs/text/maple_idlm_8gpu_fast.yaml \
   --gpus 8 --run-name maple-b1-fused-4b --hours 16 --prepare-only
 ```
@@ -68,15 +71,27 @@ Both presets set `train.checkpoint.save_optimizer` and `load_optimizer` to
 `false`. Continuation restores weights and the schedule with a fresh optimizer;
 enable both flags for full optimizer resume.
 
-A 20-step benchmark measured 12,081 original input tokens/s/GPU and 18.6%
-useful MFU over steps 5–20, a 16.8% gain over the batch-16 control. Sampled
-peak device memory was 76.4 GiB. Four billion tokens take about 11h30m plus
-startup and checkpoint saves at that rate. These short benchmarks used constant
-LR `1e-5` without warmup and do not establish long-run convergence.
+Fourteen-step benchmarks (steps 5–14) measured 28.1% useful MFU and 18,300
+original input tokens/s/GPU at microbatch 20 (63 GiB peak allocated), and
+29.9% MFU and 19,400 tokens/s/GPU at microbatch 24 (global batch 192, 66 GiB).
+The earlier FlexAttention/untuned configuration measured 19.1%. Microbatch 26
+and 28 did not improve MFU meaningfully and leave less than 5 GiB of headroom.
+These short benchmarks do not establish long-run convergence.
 
 `--prepare-only` writes `resolved.yaml` without starting training or W&B.
 Review it, run `.venv/bin/wandb login`, then repeat the command without
 `--prepare-only` to start. Use a terminal multiplexer for a long run.
+
+### Staged training
+
+A later curriculum stage starts from an exported checkpoint of the previous one:
+export it with `scripts/merge_dcp_to_hf.py`, set `idlm_initialize_mask_token:
+false` and the new `idlm_block_size`, and pass `--init-weights EXPORT_DIR` with a
+new `--run-name`. With `MAPLE_PRUNE_BEFORE_SAVE=1`, a save that would not fit
+beside the retained checkpoint first deletes it; the launcher then requires
+space for one checkpoint instead of two. `scripts/maple_idlm/acceptance.py`
+reports ISD acceptance, tokens per forward, and decode speed on held-out
+prompts for several strides (stride 1 is plain AR decoding).
 
 ## Single-GPU run
 
@@ -155,7 +170,25 @@ clean weight 0.2, with ten warmup updates. This pilot does not reproduce the
 paper's full curriculum: later stages use block sizes 2 and 3 and auto-balanced
 loss. The matching decoding stride is block size + 1.
 
-FlexAttention implements the training mask and backward. Its sparse metadata
+With `flash_attention_3` and `idlm_block_size: 1`, the mask factors into dense
+pieces: clean queries attend causally to clean keys; noisy query `i` attends to
+clean keys `j < i` and to its own noisy key. The strictly causal term is a
+varlen FA3 call whose key length per document is one shorter than its query
+length, and the self key is merged by log-sum-exp. Backward passes the merged
+output and LSE to FA3's backward, so its gradients are exactly those of the
+combined softmax. Documents come from `position_ids == 0`; collator pads are
+isolated singleton documents. For `idlm_block_size` B > 1, noisy query
+`p = jB + r` sees clean keys before `jB` and noisy keys `jB..p`. The model
+orders each document's noisy tokens by residue `r = p mod B` once at the input
+(all other layers are per token; loss targets are permuted identically). Each
+pair of query residue `r` and key residue `s` is then a strictly causal varlen
+FA3 call over strided sequences, with window `floor((W + s - r) / B)`; the at
+most B in-block noisy keys are merged in closed form.
+Training also computes router logits with a BF16 GEMM into FP32, fuses both
+loss streams into one chunked linear cross entropy, and reuses row-TWN
+statistics during checkpoint recomputation (bitwise identical to requantizing).
+
+FlexAttention implements the training mask and backward otherwise. Its sparse metadata
 is built from 128-token tile bounds, avoiding a dense quadratic token mask
 during construction. Conservative partial tiles retain the exact token-level
 mask; only tiles proven fully visible bypass it. Document boundaries, padding,
@@ -172,8 +205,12 @@ retaining low-precision rounding; the native TWN quantizer is unchanged.
 Liger supplies linear cross entropy and RMSNorm. FSDP2 data sharding is
 supported; SP/EP sizes greater than one are
 rejected. Maple's QK normalization, partial RoPE and configured global-attention
-RoPE behavior are preserved. The local 88k checkpoint uses RoPE on global
-attention (`nope_on_global_attention: false`).
+RoPE behavior are preserved. The local 88k checkpoint's `config.json` says
+`nope_on_global_attention: false`, but its shipped `modeling_maple.py` applies
+RoPE only on sliding layers and ignores the flag, so it was trained with NoPE on
+global attention. Set `nope_on_global_attention: true` in the prepared config:
+on the 128-sample held-out set the original checkpoint scores AR CE 1.064 with
+NoPE on global layers versus 1.380 with RoPE.
 
 Decoder layers use Transformers' `GradientCheckpointingLayer` for recomputation
 and async activation offload. The fast preset enables offload; the single-GPU

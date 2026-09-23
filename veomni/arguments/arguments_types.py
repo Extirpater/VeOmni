@@ -113,6 +113,10 @@ class OptimizerConfig:
         default=1.0,
         metadata={"help": "Ratio of learning rate decay steps."},
     )
+    lr_wsd_decay_ratio: float = field(
+        default=0.2,
+        metadata={"help": "With lr_decay_style 'wsd', fraction of training steps in the final linear decay."},
+    )
     weight_decay: float = field(
         default=0,
         metadata={"help": "L2 regularization strength."},
@@ -1256,6 +1260,14 @@ class OpsImplementationConfig:
             "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
             "incompatible non-default overrides raise. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
+        },
+    )
+    moe_gemm_autotune: bool = field(
+        default=False,
+        metadata={
+            "help": "Autotune fused_quack expert GEMM tiles once per tensor shape (set QUACK_CACHE_AUTOTUNING=1 "
+            "to persist results). Use only with fixed-shape batches (e.g. train.pad_to_length): every new shape "
+            "re-benchmarks. Expert-parallel paths never tune. Default tiles can be ~2x slower."
         },
     )
     cross_entropy_loss_implementation: str = field(

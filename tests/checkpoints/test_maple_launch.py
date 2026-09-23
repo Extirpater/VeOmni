@@ -88,6 +88,7 @@ def test_prepare_only_never_starts_training_or_accepts_stale_data(
         run_name="run",
         prepare_only=True,
         steps=None,
+        init_weights=None,
     )
     target = launch["prepare_run"](args)
     resolved = yaml.safe_load(target.read_text())
@@ -152,7 +153,9 @@ def test_online_launch_requires_complete_unchanged_raw_data(tmp_path):
     }
     path = tmp_path / "input.yaml"
     path.write_text(yaml.safe_dump(config))
-    args = SimpleNamespace(root=tmp_path, config=path, gpus=8, run_name="run", prepare_only=True, steps=None)
+    args = SimpleNamespace(
+        root=tmp_path, config=path, gpus=8, run_name="run", prepare_only=True, steps=None, init_weights=None
+    )
     target = launch["prepare_run"](args)
     resolved = yaml.safe_load(target.read_text())
     assert resolved["data"]["train_path"] == str(directory)
@@ -186,3 +189,42 @@ def test_deadline_saves_both_halves_before_waiting(already_saved):
     )
     save_final_checkpoint(trainer)
     assert events == (["wait"] if already_saved else ["model", "cursor", "wait"])
+
+
+def test_init_weights_starts_a_stage_from_an_export(tmp_path):
+    from veomni.data.maple import raw_shard_identity
+
+    directory = tmp_path / "raw/data"
+    directory.mkdir(parents=True)
+    (directory / "train-00000-of-00120.parquet").write_bytes(b"raw parquet")
+    manifest = dict(
+        tokenization="online",
+        data_ready=True,
+        raw_samples=100,
+        raw_shards=raw_shard_identity(tmp_path, 1),
+        requested_shards=1,
+        max_length=4096,
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    export = tmp_path / "export"
+    export.mkdir()
+    config = {
+        "model": {"model_config": {"idlm_initialize_mask_token": True}},
+        "data": {"max_seq_len": 4096, "train_size": 9000},
+        "train": {"global_batch_size": 32, "micro_batch_size": 1, "checkpoint": {"load_path": None}},
+    }
+    path = tmp_path / "input.yaml"
+    path.write_text(yaml.safe_dump(config))
+    args = SimpleNamespace(
+        root=tmp_path, config=path, gpus=8, run_name="stage2", prepare_only=True, steps=None, init_weights=export
+    )
+    with pytest.raises(ValueError, match="exported HF checkpoint"):
+        launch["prepare_run"](args)
+    (export / "config.json").write_text("{}")
+    (export / "model.safetensors").write_bytes(b"")
+    with pytest.raises(ValueError, match="idlm_initialize_mask_token: false"):
+        launch["prepare_run"](args)
+    config["model"]["model_config"]["idlm_initialize_mask_token"] = False
+    path.write_text(yaml.safe_dump(config))
+    resolved = yaml.safe_load(launch["prepare_run"](args).read_text())
+    assert resolved["model"]["model_path"] == str(export.resolve())

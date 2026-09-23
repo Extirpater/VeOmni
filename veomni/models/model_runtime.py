@@ -535,6 +535,7 @@ class VeOmniModelRuntime:
             lr_min=opt.lr_min,
             lr_decay_style=opt.lr_decay_style,
             lr_decay_ratio=opt.lr_decay_ratio,
+            lr_wsd_decay_ratio=opt.lr_wsd_decay_ratio,
             lr_warmup_ratio=opt.lr_warmup_ratio,
             lr_start=opt.lr_start,
         )

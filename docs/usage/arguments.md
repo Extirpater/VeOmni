@@ -224,6 +224,7 @@ NPU validation runs at two times:
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, and Magi values resolve to SP-aware registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
+| moe_gemm_autotune | `bool` | `False` | Autotune `fused_quack` expert GEMM tiles once per tensor shape (set `QUACK_CACHE_AUTOTUNING=1` to persist results). Use only with fixed-shape batches such as `train.pad_to_length`, since every new shape re-benchmarks; expert-parallel paths never tune. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
@@ -444,8 +445,9 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
 | lr_warmup_ratio | `float` | `0` | Ratio of learning rate warmup steps. |
-| lr_decay_style | `str` | `"constant"` | Learning rate scheduler (`"constant"`, `"linear"`, `"cosine"`). |
+| lr_decay_style | `str` | `"constant"` | Learning rate scheduler (`"constant"`, `"linear"`, `"cosine"`, `"wsd"`). `"wsd"` is warmup-stable-decay: linear warmup, constant peak, then linear decay to `lr_min` over the final `lr_wsd_decay_ratio` of steps. |
 | lr_decay_ratio | `float` | `1.0` | Ratio of learning rate decay steps. |
+| lr_wsd_decay_ratio | `float` | `0.2` | With `lr_decay_style: "wsd"`, fraction of training steps in the final linear decay. |
 | weight_decay | `float` | `0` | L2 regularization strength. |
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |

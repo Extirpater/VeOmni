@@ -1,5 +1,5 @@
 # Measured eight-H100 recipe: stride 2, fused packed experts, QAT, FSDP2.
-# Launch with PYTORCH_ALLOC_CONF=backend:cudaMallocAsync; allow 160 GiB for weights rotation.
+# launch.py defaults to expandable segments and tuned Quack GEMMs; allow 160 GiB for weights rotation.
 # Paths and mask ID are filled from the pinned preparation manifest by launch.py.
 model:
   model_path: outputs/maple_idlm/model
@@ -16,8 +16,9 @@ model:
     ternary_group_size: 128
     use_cache: false
   ops_implementation:
-    attn_implementation: flex_attention
+    attn_implementation: flash_attention_3
     moe_implementation: fused_quack
+    moe_gemm_autotune: true
     qat_implementation: ternary
     cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
@@ -59,9 +60,9 @@ data:
   datasets_type: mapping
   dataset_repeat: true
   dataloader:
-    num_workers: 4
+    num_workers: 8
     worker_num_threads: 1
-    prefetch_factor: 2
+    prefetch_factor: 8
     persistent_workers: true
     pin_memory: false
 train:

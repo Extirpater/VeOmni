@@ -19,6 +19,8 @@
 #      Override MapleMLP.__init__
 #    - method_override: MapleMLP.forward
 #      Override MapleMLP.forward
+#    - method_override: MapleGate.forward
+#      Override MapleGate.forward
 #    - method_override: MapleSparseMoeBlock._setup_experts
 #      Override MapleSparseMoeBlock._setup_experts
 #    - method_override: MapleSparseMoeBlock.forward
@@ -55,11 +57,24 @@ from transformers.utils import logging as hf_logging
 
 # Additional imports for patches
 from veomni.models.transformers.maple.configuration_maple import MapleConfig
+from veomni.models.transformers.maple.idlm_flash import (
+    IDLMFlashBlockMask,
+    IDLMFlashMask,
+    idlm_flash_attention,
+    idlm_flash_block_attention,
+    make_idlm_flash_block_masks,
+    make_idlm_flash_masks,
+    uses_flash_attention_3,
+)
 from veomni.models.transformers.maple.runtime import (
     balanced_idlm_loss,
     make_idlm_attention_mask,
+    maple_add_rms_norm,
+    maple_rms_norm,
+    maple_router_logits,
     prepare_idlm_inputs,
     shifted_targets,
+    weighted_linear_loss,
 )
 
 # Additional import blocks for patches
@@ -90,13 +105,15 @@ class MapleExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(config.num_experts, config.hidden_size, config.moe_intermediate_size)
         )
+        # Row-TWN statistics from the last forward, reused by checkpoint recomputation.
+        self._twn_stats = ({}, {})
 
     def forward(self, hidden_states, indices, weights):
         gate_up, down = self.gate_up_proj, self.down_proj
         if veomni_qat.value == "ternary":
             options = dict(group_size=self.config.ternary_group_size, scheme=self.config.ternary_scheme)
-            gate_up = ternary_fake_quant_weight(gate_up, **options)
-            down = ternary_fake_quant_weight(down, **options)
+            gate_up = ternary_fake_quant_weight(gate_up, **options, stats_cache=self._twn_stats[0])
+            down = ternary_fake_quant_weight(down, **options, stats_cache=self._twn_stats[1])
         if veomni_moe.value in ("fused_triton", "fused_quack"):
             if veomni_moe.value == "fused_quack":
                 from veomni.ops.kernels.moe.quack_gemm import quack_gemm_fused_moe_forward as moe_kernel
@@ -246,6 +263,12 @@ class MapleRMSNorm(nn.Module):
         return self.weight * normed.to(hidden_states.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] MapleGate
+# Methods patched: forward
+# ======================================================================
+
+
 class MapleGate(nn.Module):
     def __init__(self, config: MapleConfig):
         super().__init__()
@@ -258,9 +281,13 @@ class MapleGate(nn.Module):
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def forward(self, hidden_states: torch.Tensor):
+    # Patch: MapleGate.forward
+    # 1. Compute FP32 router logits from BF16 operands on BF16 tensor cores.
+    def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        # --- Patch.1 ---
+        logits = maple_router_logits(hidden_states, self.weight)
+        # --- Patch.1 ---
         routing_weights = F.softmax(logits, dim=1, dtype=torch.float)
         scores, topk_idx = torch.topk(routing_weights, self.top_k, dim=-1)
         scores = scores.type_as(logits)
@@ -339,6 +366,7 @@ class MapleAttention(nn.Module):
 
     # Patch: MapleAttention.forward
     # 1. Quantize attention projections with the checkpoint's ternary recipe.
+    # 2. Run FA3 varlen metadata through the I-DLM FlashAttention-3 path.
     def forward(
         self,
         hidden_states,
@@ -356,27 +384,35 @@ class MapleAttention(nn.Module):
             enabled=veomni_qat.value == "ternary",
         )
         # --- Patch.1 ---
-        query = (
-            ternary_linear(hidden_states, self.q_proj.weight, **options)
-            .view(batch, length, self.num_heads, self.head_dim)
-            .transpose(1, 2)
+        query = ternary_linear(hidden_states, self.q_proj.weight, **options).view(
+            batch, length, self.num_heads, self.head_dim
         )
-        key = (
-            ternary_linear(hidden_states, self.k_proj.weight, **options)
-            .view(batch, length, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
+        key = ternary_linear(hidden_states, self.k_proj.weight, **options).view(
+            batch, length, self.num_key_value_heads, self.head_dim
         )
-        value = (
-            ternary_linear(hidden_states, self.v_proj.weight, **options)
-            .view(batch, length, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
+        value = ternary_linear(hidden_states, self.v_proj.weight, **options).view(
+            batch, length, self.num_key_value_heads, self.head_dim
         )
+        rotate = self.sliding_window is not None or not self.config.nope_on_global_attention
+        mask = attention_mask["sliding_attention" if self.sliding_window is not None else "full_attention"]
+        if isinstance(mask, (IDLMFlashMask, IDLMFlashBlockMask)):
+            # --- Patch.2 ---
+            # FA3 varlen keeps the token-major layout of one packed row; QK norm
+            # and partial RoPE run as one fused kernel per tensor.
+            rope = position_embeddings[:2] if rotate else None
+            query = maple_rms_norm(query, self.q_norm.weight, self.q_norm.variance_epsilon, rope)
+            key = maple_rms_norm(key, self.k_norm.weight, self.k_norm.variance_epsilon, rope)
+            attend = idlm_flash_attention if isinstance(mask, IDLMFlashMask) else idlm_flash_block_attention
+            output = attend(query[0], key[0], value[0], mask, self.scaling)
+            output = output.reshape(batch, length, -1)
+            return ternary_linear(output, self.o_proj.weight, self.o_proj.bias, **options), None, past_key_value
+            # --- Patch.2 ---
         query, key = self.q_norm(query), self.k_norm(key)
-        if self.sliding_window is not None or not self.config.nope_on_global_attention:
+        query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+        if rotate:
             query, key = apply_rotary_pos_emb(query, key, *position_embeddings[:2])
         if use_cache:
             key, value = past_key_value.update(key, value, self.layer_idx)
-        mask = attention_mask["sliding_attention" if self.sliding_window is not None else "full_attention"]
         implementation = self.config._attn_implementation
         if implementation in ("eager", "sdpa"):
             key = key.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
@@ -435,8 +471,13 @@ class MapleDecoderLayer(GradientCheckpointingLayer):
         position_embeddings=None,
         **kwargs,
     ):
+        # With a non-eager rms_norm backend, training runs the norms and the middle
+        # residual add as compiled kernels.
+        fused = veomni_rms_norm.use_non_eager_impl and self.training and hidden_states.is_cuda
+        norm = self.input_layernorm
+        normed = maple_rms_norm(hidden_states, norm.weight, norm.variance_epsilon) if fused else norm(hidden_states)
         attention, attention_weights, present = self.self_attn(
-            hidden_states=self.input_layernorm(hidden_states),
+            hidden_states=normed,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -446,8 +487,13 @@ class MapleDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = hidden_states + attention
-        expert_output, router_logits = self.mlp(self.post_attention_layernorm(hidden_states))
+        if fused:
+            norm = self.post_attention_layernorm
+            hidden_states, normed = maple_add_rms_norm(hidden_states, attention, norm.weight, norm.variance_epsilon)
+        else:
+            hidden_states = hidden_states + attention
+            normed = self.post_attention_layernorm(hidden_states)
+        expert_output, router_logits = self.mlp(normed)
         return hidden_states + expert_output, attention_weights, present, 0.0, router_logits
 
 
@@ -463,6 +509,7 @@ class MaplePreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["MapleDecoderLayer"]
     _supports_attention_backend = True
+    _supports_flash_attn = True
     _supports_flex_attn = True
     _supports_sdpa = True
 
@@ -581,27 +628,32 @@ class MapleModel(MaplePreTrainedModel):
                 segments = (position_ids == 0).cumsum(-1)
                 key_positions, key_segments, key_valid = position_ids, segments, valid
             # Non-I-DLM forwards are the causal verification/AR path.
-            masks = {}
-            for name, window in (("full_attention", None), ("sliding_attention", self.config.sliding_window)):
-                if "flex" in self.config._attn_implementation:
-                    from veomni.models.transformers.maple.runtime import make_causal_block_mask
+            if uses_flash_attention_3(self.config):
+                if use_cache:
+                    raise ValueError("Maple FA3 attention does not support KV caching; use sdpa or flex_attention")
+                masks = make_idlm_flash_masks(position_ids, valid, self.config.sliding_window, idlm=False)
+            else:
+                masks = {}
+                for name, window in (("full_attention", None), ("sliding_attention", self.config.sliding_window)):
+                    if "flex" in self.config._attn_implementation:
+                        from veomni.models.transformers.maple.runtime import make_causal_block_mask
 
-                    masks[name] = make_causal_block_mask(
-                        position_ids,
-                        segments,
-                        valid,
-                        window,
-                        key_positions=key_positions,
-                        key_segments=key_segments,
-                        key_valid=key_valid,
-                    )
-                else:
-                    delta = position_ids[:, :, None] - key_positions[:, None, :]
-                    mask = (delta >= 0) & (segments[:, :, None] == key_segments[:, None, :])
-                    mask = mask & valid[:, :, None] & key_valid[:, None, :]
-                    if window is not None:
-                        mask = mask & (delta <= window)
-                    masks[name] = mask[:, None]
+                        masks[name] = make_causal_block_mask(
+                            position_ids,
+                            segments,
+                            valid,
+                            window,
+                            key_positions=key_positions,
+                            key_segments=key_segments,
+                            key_valid=key_valid,
+                        )
+                    else:
+                        delta = position_ids[:, :, None] - key_positions[:, None, :]
+                        mask = (delta >= 0) & (segments[:, :, None] == key_segments[:, None, :])
+                        mask = mask & valid[:, :, None] & key_valid[:, None, :]
+                        if window is not None:
+                            mask = mask & (delta <= window)
+                        masks[name] = mask[:, None]
             attention_mask = masks
         hidden = inputs_embeds
         positions = self.rotary_emb(hidden, position_ids)
@@ -626,6 +678,7 @@ class MapleModel(MaplePreTrainedModel):
 # Patch: MapleForCausalLM
 # 1. Normalize supervised loss sums by the trainer's unshifted response-token
 #    count so packing and data-parallel partitioning preserve the objective.
+# 2. Fuse both I-DLM streams into one weighted linear cross entropy with Liger.
 class MapleForCausalLM(MaplePreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.word_embeddings.weight"}
 
@@ -674,21 +727,32 @@ class MapleForCausalLM(MaplePreTrainedModel, GenerationMixin):
                 valid = (
                     torch.ones_like(input_ids, dtype=torch.bool) if attention_mask is None else attention_mask.bool()
                 )
-                masks = {}
-                for name, window in (("full_attention", None), ("sliding_attention", self.config.sliding_window)):
-                    masks[name] = make_idlm_attention_mask(
-                        position_ids,
-                        valid,
-                        self.config.idlm_block_size,
-                        sliding_window=window,
-                        flex="flex" in self.config._attn_implementation,
-                    )
+                block_size, window = self.config.idlm_block_size, self.config.sliding_window
+                noisy_order = None
+                if not uses_flash_attention_3(self.config):
+                    flex = "flex" in self.config._attn_implementation
+                    masks = {
+                        name: make_idlm_attention_mask(position_ids, valid, block_size, sliding_window=w, flex=flex)
+                        for name, w in (("full_attention", None), ("sliding_attention", window))
+                    }
+                elif block_size == 1:
+                    masks = make_idlm_flash_masks(position_ids, valid, window)
+                else:
+                    masks = make_idlm_flash_block_masks(position_ids, valid, window, block_size)
+                    noisy_order = masks["full_attention"].noisy_order
                 input_ids, position_ids, noisy_targets, targets = prepare_idlm_inputs(
                     input_ids,
                     labels,
                     position_ids,
                     self.config.mask_token_id,
                 )
+                if noisy_order is not None:
+                    # Block FA3 attention expects residue-ordered noisy tokens; every
+                    # other op is per token, and the loss permutes its targets alike.
+                    length = noisy_targets.shape[-1]
+                    order = torch.cat((noisy_order, torch.arange(length, 2 * length, device=noisy_order.device)))
+                    input_ids, position_ids = input_ids[:, order], position_ids[:, order]
+                    noisy_targets = noisy_targets[:, noisy_order]
                 attention_mask = masks
         outputs = self.model(
             input_ids=input_ids,
@@ -705,6 +769,25 @@ class MapleForCausalLM(MaplePreTrainedModel, GenerationMixin):
         clean_count = (targets != -100).sum()
         if noisy_targets is None:
             loss = linear_loss(hidden, self.lm_head.weight, targets, veomni_ce.value) * clean_count / normalizer
+        elif veomni_ce.value == "liger_kernel" and not self.config.idlm_auto_balance and hidden.requires_grad:
+            # --- Patch.2 ---
+            # One fused pass over both streams; the clean weight is applied inside it.
+            # It forms gradients in forward, so evaluation keeps the per-stream path.
+            noisy_count = (noisy_targets != -100).sum()
+            length = noisy_targets.shape[-1]
+            weighted_sum, per_token = weighted_linear_loss(
+                hidden,
+                self.lm_head.weight,
+                torch.cat((noisy_targets, targets), -1),
+                ((length, 1.0), (length, self.config.idlm_clean_weight)),
+            )
+            loss = weighted_sum / normalizer
+            per_token = per_token.detach()
+            metrics = {
+                "idlm_masked_ce": per_token[:length].sum() / noisy_count.clamp_min(1),
+                "idlm_clean_ce": per_token[length:].sum() / clean_count.clamp_min(1),
+            }
+            # --- Patch.2 ---
         else:
             noisy_hidden, clean_hidden = hidden.chunk(2, dim=1)
             masked_loss = linear_loss(noisy_hidden, self.lm_head.weight, noisy_targets, veomni_ce.value)

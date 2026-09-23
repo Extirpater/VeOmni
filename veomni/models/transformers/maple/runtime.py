@@ -442,3 +442,161 @@ def load_maple_for_inference(checkpoint, *, config=None, attention="flex_attenti
     finally:
         dist.destroy_process_group()
         clear_parallel_state()
+
+
+class _RouterLinear(torch.autograd.Function):
+    """FP32 router logits from BF16 operands without FP32 operand copies.
+
+    Router inputs are BF16 activations and FSDP's BF16 compute copy of the
+    weight, so a BF16 tensor-core GEMM with FP32 accumulation and output forms
+    the same exact products as the FP32 GEMM; only summation order differs.
+    Backward rounds the FP32 logit gradient to BF16 for its two GEMMs, whose
+    results are BF16 gradients.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight):
+        ctx.save_for_backward(hidden_states, weight)
+        return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad_logits):
+        hidden_states, weight = ctx.saved_tensors
+        grad_logits = grad_logits.to(hidden_states.dtype)
+        return grad_logits @ weight, grad_logits.t() @ hidden_states
+
+
+def maple_router_logits(hidden_states, weight):
+    if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return F.linear(hidden_states.float(), weight.float())
+    return _RouterLinear.apply(hidden_states, weight)
+
+
+class _WeightedFusedLinearCE(torch.autograd.Function):
+    """Chunked linear cross entropy with one loss weight per token segment.
+
+    Returns the weighted CE sum as the differentiable loss plus FP32 per-token
+    CE. Gradients are formed chunk by chunk in forward, as in Liger's fused
+    kernel. Chunks never cross segments, so each segment weight is applied as
+    an exact FP32 GEMM scale, and the language-head gradient accumulates in
+    FP32 inside each GEMM instead of a vocabulary-sized cast and add per chunk.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight, targets, segments, chunk_size):
+        import triton
+        from liger_kernel.ops.cross_entropy import liger_cross_entropy_kernel
+
+        tokens, vocab = hidden.shape[0], weight.shape[0]
+        per_token = torch.zeros(tokens, dtype=torch.float32, device=hidden.device)
+        grad_hidden = torch.empty_like(hidden)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+        block = min(65536 // 2, triton.next_power_of_2(vocab))
+        total = hidden.new_zeros((), dtype=torch.float32)
+        offset = 0
+        for length, scale in segments:
+            for start in range(offset, offset + length, chunk_size):
+                end = min(start + chunk_size, offset + length)
+                hidden_chunk, target_chunk = hidden[start:end], targets[start:end].contiguous()
+                logits = hidden_chunk @ weight.t()
+                loss_chunk = per_token[start:end]
+                # Replaces logits in place with d(sum CE)/d(logits); ignored rows get zero.
+                liger_cross_entropy_kernel[(end - start,)](
+                    X_ptr=logits,
+                    X_stride=logits.stride(-2),
+                    Y_ptr=target_chunk,
+                    Y_stride=target_chunk.stride(-1),
+                    weight_ptr=None,
+                    loss_ptr=loss_chunk,
+                    z_loss_ptr=None,
+                    loss_stride=loss_chunk.stride(-1),
+                    token_accuracy_ptr=None,
+                    token_accuracy_stride=0,
+                    n_cols=vocab,
+                    n_non_ignore=1,
+                    sum_non_ignore_weight=1,
+                    weight_sum=0.0,
+                    ignore_index=-100,
+                    lse_square_scale=0.0,
+                    label_smoothing=0.0,
+                    reduction="sum",
+                    softcap=None,
+                    RETURN_Z_LOSS=False,
+                    RETURN_TOKEN_ACCURACY=False,
+                    HAS_WEIGHT=False,
+                    HAS_SOFTCAPPING=False,
+                    HAS_GRADIENTS=True,
+                    BLOCK_SIZE=block,
+                    num_warps=32,
+                )
+                grad_hidden[start:end] = torch.mm(logits, weight, out_dtype=torch.float32).mul_(scale)
+                torch.addmm(
+                    grad_weight, logits.t(), hidden_chunk, alpha=scale, out_dtype=torch.float32, out=grad_weight
+                )
+            total = total + scale * per_token[offset : offset + length].sum()
+            offset += length
+        if offset != tokens:
+            raise ValueError("Loss segments must cover every token")
+        ctx.save_for_backward(grad_hidden, grad_weight.to(weight.dtype))
+        return total, per_token
+
+    @staticmethod
+    def backward(ctx, grad_loss, _grad_per_token):
+        # Gradients were formed in forward; scale them in place (backward runs once).
+        grad_hidden, grad_weight = ctx.saved_tensors
+        return grad_hidden.mul_(grad_loss), grad_weight.mul_(grad_loss), None, None, None
+
+
+def weighted_linear_loss(hidden, weight, targets, segments):
+    """Return ``sum_s weight_s * sum(CE_s)`` and FP32 per-token CE (zero where ignored).
+
+    ``segments`` lists ``(token_count, weight)`` pairs covering the flattened tokens.
+    """
+    hidden, targets = hidden.reshape(-1, hidden.shape[-1]), targets.reshape(-1)
+    vocab, width = weight.shape
+    # Liger's heuristic keeps a logits chunk near the size of the hidden input.
+    chunk = 1 << max(0, (-(-hidden.shape[0] * width // vocab) - 1).bit_length())
+    segments = tuple((int(length), float(scale)) for length, scale in segments)
+    return _WeightedFusedLinearCE.apply(hidden, weight, targets, segments, chunk)
+
+
+def _rms(states, weight, eps: float):
+    normed = states.float()
+    return (normed * torch.rsqrt(normed.square().mean(-1, keepdim=True) + eps)).to(states.dtype) * weight
+
+
+@torch.compile(fullgraph=True)
+def _rms_rope(states, weight, eps: float, cos, sin):
+    normed = _rms(states, weight, eps)
+    if cos is None:
+        return normed
+    rotary = cos.shape[-1]
+    half = rotary // 2
+    rotated = normed[..., :rotary].float()
+    cos, sin = cos.float()[:, :, None], sin.float()[:, :, None]
+    turned = torch.cat((-rotated[..., half:], rotated[..., :half]), -1)
+    return torch.cat(((rotated * cos + turned * sin).to(states.dtype), normed[..., rotary:]), -1)
+
+
+@torch.compile(fullgraph=True)
+def _add_rms(states, delta, weight, eps: float):
+    states = states + delta
+    return states, _rms(states, weight, eps)
+
+
+def maple_rms_norm(states, weight, eps, rope=None):
+    """Maple RMSNorm as one compiled kernel, optionally followed by partial RoPE.
+
+    The norm keeps Maple's rounding (FP32 statistics, BF16 normalized value
+    times weight). ``rope`` is ``(cos, sin)`` of shape ``[B, L, rotary_dim]``
+    for token-major ``[B, L, H, D]`` states; the rotation is evaluated in FP32
+    and rounded once, instead of rounding each BF16 product and sum as
+    ``apply_rotary_pos_emb`` does.
+    """
+    cos, sin = rope if rope is not None else (None, None)
+    return _rms_rope(states, weight, float(eps), cos, sin)
+
+
+def maple_add_rms_norm(states, delta, weight, eps):
+    """Residual add followed by Maple RMSNorm; returns the sum and its norm."""
+    return _add_rms(states, delta, weight, float(eps))

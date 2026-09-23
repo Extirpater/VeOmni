@@ -85,11 +85,9 @@ class RunMetrics(Callback):
                     temporary.write_text(json.dumps(dict(start=self.start, deadline=self.deadline)))
                     temporary.replace(clock)
 
-    def prune_checkpoints(self):
-        if dist.get_rank() != 0:
-            return
+    def complete_checkpoints(self):
         checkpoints = Path(self.trainer.args.train.checkpoint.save_path)
-        complete = sorted(
+        return sorted(
             (
                 path
                 for path in checkpoints.glob("global_step_*")
@@ -97,8 +95,27 @@ class RunMetrics(Callback):
             ),
             key=lambda path: int(path.name[12:]),
         )
+
+    def make_room(self):
+        """Before a save, drop the oldest retained checkpoints until the new one fits."""
+        if dist.get_rank() == 0:
+            complete = self.complete_checkpoints()
+            if complete:
+                save_path = Path(self.trainer.args.train.checkpoint.save_path)
+                save_path.mkdir(parents=True, exist_ok=True)
+                need = sum(f.stat().st_size for f in complete[-1].rglob("*") if f.is_file()) * 1.05 + 10 * 1024**3
+                for path in complete:
+                    if shutil.disk_usage(save_path).free >= need:
+                        break
+                    print(f"[maple] pruning {path} before save to free disk space", flush=True)
+                    shutil.rmtree(path)
+        dist.barrier()
+
+    def prune_checkpoints(self):
+        if dist.get_rank() != 0:
+            return
         # Only prune this run's older, completed checkpoints.
-        for path in complete[: -self.keep_checkpoints]:
+        for path in self.complete_checkpoints()[: -self.keep_checkpoints]:
             shutil.rmtree(path)
 
     def on_step_end(self, state, **kwargs):
@@ -142,7 +159,20 @@ def main():
         return norm
 
     trainer.base.model.clip_grad_norm = finite_clip
-    trainer.base._callbacks.append(RunMetrics(trainer.base))
+    metrics = RunMetrics(trainer.base)
+    trainer.base._callbacks.append(metrics)
+    if os.environ.get("MAPLE_PRUNE_BEFORE_SAVE", "0") == "1":
+        # A save that would not fit beside the retained checkpoints first removes
+        # the oldest, trading rotation safety for disk. Every DCP write, including
+        # the one behind an HF export, goes through the model's checkpoint manager.
+        checkpoint_manager = trainer.base.model.checkpoint
+        original_save = checkpoint_manager.save_dcp
+
+        def save_with_room(state):
+            metrics.make_room()
+            return original_save(state)
+
+        checkpoint_manager.save_dcp = save_with_room
     try:
         trainer.train()
     except WallTimeReached:

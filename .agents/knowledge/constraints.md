@@ -263,3 +263,7 @@ Core files:
 33. **Large packed iDLM masks must be built at tile granularity**
     - Generic compiled `create_block_mask()` can materialize a dense boolean `[2N, 2N]` temporary: 25 GiB at 81,920 input tokens per rank. Sparse attention execution does not make this construction sparse.
     - Maple builds metadata from 128-token bounds with `BlockMask.from_kv_blocks()`. Partial tiles may conservatively include invisible pairs because the unchanged token-level `mask_mod` filters them; full tiles must prove every pair visible. Preserve padding, document, sliding-window and noisy/clean-boundary checks when changing the bounds.
+
+34. **Maple checkpoints' `nope_on_global_attention` must match their training code, not their config**
+    - The local 88k latent-master `config.json` says `false`, but its shipped modeling code applies RoPE only on sliding layers and never reads the flag. VeOmni honors the flag, so trusting the config applies RoPE to global layers the model never saw: held-out AR CE 1.380 versus 1.064 with NoPE.
+    - Verify against the checkpoint's own modeling code (or an A/B held-out evaluation) before preparing a root. Exports trained under one setting must keep that setting in their config.
